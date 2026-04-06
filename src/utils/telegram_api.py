@@ -196,8 +196,8 @@ class TelegramAPI:
             if self.client:
                 try:
                     await self.client.disconnect()
-                except:
-                    pass
+                except Exception as disconnect_error:
+                    logger.debug(f"Client disconnect error during cleanup: {disconnect_error}")
                 self.client = None
             return False, f"Verification code sending failed: {str(e)}. Please check your API credentials."
             
@@ -272,8 +272,8 @@ class TelegramAPI:
             if created_new_client and client:
                 try:
                     await client.disconnect()
-                except:
-                    pass
+                except Exception as disconnect_error:
+                    logger.debug(f"Client disconnect error: {disconnect_error}")
             
     async def get_user_groups(self, phone_number):
         """Get user's groups and channels - NO DEMO FALLBACK"""
@@ -491,8 +491,8 @@ class TelegramAPI:
             if client:
                 try:
                     await client.disconnect()
-                except:
-                    pass
+                except Exception as disconnect_error:
+                    logger.debug(f"Client disconnect error in get_user_groups: {disconnect_error}")
     
     async def send_message_to_groups(self, phone_number, message_text, group_ids, delay_seconds=1):
         """Send message to specified groups with rate limiting and session locking - NO DEMO FALLBACK"""
@@ -584,8 +584,8 @@ class TelegramAPI:
             if client:
                 try:
                     await client.disconnect()
-                except:
-                    pass
+                except Exception as disconnect_error:
+                    logger.debug(f"Client disconnect error in send_message_to_groups: {disconnect_error}")
 
     async def cleanup_client(self, phone_number):
         """Clean up client resources"""

@@ -11,22 +11,45 @@ import json
 logger = setup_logging()
 
 # Global message queue for rate limiting across all users
+# Stores only message IDs, not full objects to avoid SQLAlchemy detached instance issues
 _message_queue = asyncio.Queue()
 _queue_processor_started = False
+_queue_processor_lock = asyncio.Lock()
 
 async def process_message_queue():
-    """Process messages from queue with global rate limiting"""
+    """Process messages from queue with global rate limiting - SINGLE INSTANCE ONLY"""
     global _queue_processor_started
-    _queue_processor_started = True
+    
+    # Ensure only one queue processor runs
+    async with _queue_processor_lock:
+        if _queue_processor_started:
+            logger.debug("Queue processor already running, skipping")
+            return
+        _queue_processor_started = True
+    
     logger.info("Global message queue processor started")
     
     while True:
         try:
-            # Get message from queue
-            message_task = await _message_queue.get()
+            # Get message ID from queue (not full object)
+            message_id = await _message_queue.get()
             
-            # Process with rate limiting (max 30 messages per minute globally)
-            await send_scheduled_message_isolated(message_task)
+            # Fetch fresh message from database
+            from ..models.database import get_session, ScheduledMessage
+            db_session = get_session()
+            try:
+                message = db_session.query(ScheduledMessage).filter(
+                    ScheduledMessage.id == message_id,
+                    ScheduledMessage.is_active == True
+                ).first()
+                
+                if message:
+                    # Process with rate limiting
+                    await send_scheduled_message_isolated(message)
+                else:
+                    logger.warning(f"Message {message_id} not found or inactive")
+            finally:
+                db_session.close()
             
             # Small delay to prevent too many requests
             await asyncio.sleep(2)  # 2 second delay between any two messages
@@ -50,6 +73,96 @@ def cleanup_session_file(phone_number):
     except Exception as e:
         logger.error(f"Error cleaning up session file: {e}")
 
+async def cleanup_old_data():
+    """Clean up old data to prevent server overload"""
+    logger.info("Starting old data cleanup...")
+    db_session = get_session()
+    try:
+        now = datetime.utcnow()
+        
+        # 1. Delete old sent messages (older than 24 hours)
+        one_day_ago = now - timedelta(hours=24)
+        old_sent_messages = db_session.query(ScheduledMessage).filter(
+            ScheduledMessage.is_sent == True,
+            ScheduledMessage.schedule_time < one_day_ago,
+            ScheduledMessage.is_repeat == False  # Only non-repeating messages
+        ).all()
+        
+        deleted_sent_count = 0
+        for msg in old_sent_messages:
+            db_session.delete(msg)
+            deleted_sent_count += 1
+        
+        if deleted_sent_count > 0:
+            logger.info(f"Deleted {deleted_sent_count} old sent messages")
+        
+        # 2. Delete old rejected payments (older than 30 days)
+        thirty_days_ago = now - timedelta(days=30)
+        from ..models.database import Payment
+        old_rejected_payments = db_session.query(Payment).filter(
+            Payment.status == 'rejected',
+            Payment.processed_at < thirty_days_ago
+        ).all()
+        
+        deleted_payment_count = 0
+        for payment in old_rejected_payments:
+            db_session.delete(payment)
+            deleted_payment_count += 1
+        
+        if deleted_payment_count > 0:
+            logger.info(f"Deleted {deleted_payment_count} old rejected payments")
+        
+        # 3. Clean up old log files (keep only last 7 days)
+        try:
+            logs_dir = 'logs'
+            if os.path.exists(logs_dir):
+                seven_days_ago = now - timedelta(days=7)
+                for filename in os.listdir(logs_dir):
+                    if filename.endswith('.log'):
+                        filepath = os.path.join(logs_dir, filename)
+                        file_mtime = datetime.fromtimestamp(os.path.getmtime(filepath))
+                        if file_mtime < seven_days_ago:
+                            os.remove(filepath)
+                            logger.info(f"Deleted old log file: {filename}")
+        except Exception as log_error:
+            logger.error(f"Error cleaning up log files: {log_error}")
+        
+        # 4. Clean up orphaned session files
+        try:
+            sessions_dir = 'sessions'
+            if os.path.exists(sessions_dir):
+                # Get all active phone numbers from database
+                active_phones = set()
+                users = db_session.query(User).filter(User.phone_number != None).all()
+                for user in users:
+                    active_phones.add(user.phone_number.replace('+', ''))
+                
+                # Remove session files for inactive users
+                for filename in os.listdir(sessions_dir):
+                    if filename.endswith('.session'):
+                        phone_from_file = filename.replace('_session.session', '')
+                        if phone_from_file not in active_phones:
+                            filepath = os.path.join(sessions_dir, filename)
+                            os.remove(filepath)
+                            logger.info(f"Deleted orphaned session file: {filename}")
+        except Exception as session_error:
+            logger.error(f"Error cleaning up session files: {session_error}")
+        
+        db_session.commit()
+        logger.info("Old data cleanup completed")
+        
+    except Exception as e:
+        logger.error(f"Error during cleanup: {e}")
+        try:
+            db_session.rollback()
+        except Exception as rollback_error:
+            logger.error(f"Cleanup rollback error: {rollback_error}")
+    finally:
+        try:
+            db_session.close()
+        except Exception as close_error:
+            logger.error(f"Cleanup session close error: {close_error}")
+
 def start_scheduler():
     """Start the message scheduler in background thread"""
     try:
@@ -72,13 +185,22 @@ def _run_scheduler_thread():
         logger.error(f"Rejalashtiruvchi jarayonida xato: {e}")
 
 async def run_scheduler():
-    """Main scheduler loop"""
+    """Main scheduler loop with periodic cleanup"""
     logger.info("Xabar rejalashtiruvchi ishga tushdi")
+    
+    cleanup_counter = 0
     
     while True:
         try:
             # Check for messages to send every minute
             await check_and_send_messages()
+            
+            # Run cleanup every 60 minutes (every 60 iterations)
+            cleanup_counter += 1
+            if cleanup_counter >= 60:
+                await cleanup_old_data()
+                cleanup_counter = 0
+            
             await asyncio.sleep(60)  # Wait 1 minute
         except Exception as e:
             logger.error(f"Rejalashtiruvchida xato: {e}")
@@ -91,43 +213,45 @@ async def check_and_send_messages():
         # Get pending messages that should be sent now
         now = datetime.utcnow()
         
-        # 1. Get one-time or newly created repeating messages that are due
-        pending_messages = db_session.query(ScheduledMessage).filter(
-            ScheduledMessage.schedule_time <= now,
-            ScheduledMessage.is_active == True,
-            ScheduledMessage.is_sent == False
-        ).all()
-        
-        # 2. Handle repeating messages that were already sent once
-        repeating_messages = db_session.query(ScheduledMessage).filter(
-            ScheduledMessage.is_active == True,
-            ScheduledMessage.is_repeat == True,
-            ScheduledMessage.is_sent == True
-        ).all()
-        
-        rescheduled_count = 0
-        for message in repeating_messages:
-            # For repeating messages, schedule_time is the time it was LAST scheduled to run
-            # We check if now is past (last schedule time + interval)
-            interval = message.repeat_interval or 5
-            next_run_time = message.schedule_time + timedelta(minutes=interval)
+        # Use atomic transaction for all database operations
+        try:
+            # 1. Handle repeating messages that were already sent once (ATOMIC)
+            repeating_messages = db_session.query(ScheduledMessage).filter(
+                ScheduledMessage.is_active == True,
+                ScheduledMessage.is_repeat == True,
+                ScheduledMessage.is_sent == True
+            ).all()
             
-            if now >= next_run_time:
-                # Update schedule time to the next interval
-                # If we are way behind, catch up to current time
-                while next_run_time <= now:
-                    next_run_time += timedelta(minutes=interval)
+            rescheduled_count = 0
+            for message in repeating_messages:
+                interval = message.repeat_interval or 5
+                next_run_time = message.schedule_time + timedelta(minutes=interval)
                 
-                message.schedule_time = next_run_time - timedelta(minutes=interval) # Current run time
-                message.is_sent = False  # Mark as ready to send again
-                pending_messages.append(message)
-                rescheduled_count += 1
-                # Convert to Uzbekistan time for logging
-                uz_next_time = next_run_time + timedelta(hours=5)
-                logger.info(f"Repeating message {message.id} triggered. Next will be at {next_run_time} (UZ: {uz_next_time.strftime('%Y-%m-%d %H:%M')})")
-        
-        if rescheduled_count > 0:
-            db_session.commit()
+                if now >= next_run_time:
+                    while next_run_time <= now:
+                        next_run_time += timedelta(minutes=interval)
+                    
+                    message.schedule_time = next_run_time - timedelta(minutes=interval)
+                    message.is_sent = False
+                    rescheduled_count += 1
+                    uz_next_time = next_run_time + timedelta(hours=5)
+                    logger.info(f"Repeating message {message.id} triggered. Next: {next_run_time} (UZ: {uz_next_time.strftime('%Y-%m-%d %H:%M')})")
+            
+            if rescheduled_count > 0:
+                db_session.commit()
+                logger.info(f"Rescheduled {rescheduled_count} repeating messages")
+            
+            # 2. Get pending messages (after commit for fresh data)
+            pending_messages = db_session.query(ScheduledMessage).filter(
+                ScheduledMessage.schedule_time <= now,
+                ScheduledMessage.is_active == True,
+                ScheduledMessage.is_sent == False
+            ).all()
+            
+        except Exception as db_error:
+            logger.error(f"Database error in atomic transaction: {db_error}")
+            db_session.rollback()
+            pending_messages = []
         
         # 3. Auto-delete messages older than 6 hours and cleanup session files
         six_hours_go = now - timedelta(hours=6)
@@ -165,31 +289,37 @@ async def check_and_send_messages():
                 asyncio.create_task(process_message_queue())
                 await asyncio.sleep(0.5)  # Wait for processor to start
             
-            # Add all messages to queue
+            # Commit any pending changes before adding to queue
+            db_session.commit()
+            
+            # Add all message IDs to queue (not full objects)
             queued_count = 0
             for message in pending_messages:
-                db_session.refresh(message)
                 if not message.is_active:
                     logger.info(f"Message {message.id} was deactivated, skipping")
                     continue
                 
-                await _message_queue.put(message)
+                # Mark as sent immediately to prevent duplicate queuing
+                message.is_sent = True
+                await _message_queue.put(message.id)
                 queued_count += 1
                 logger.info(f"Message {message.id} added to queue (position: {_message_queue.qsize()})")
             
+            # Commit the is_sent changes
+            db_session.commit()
             logger.info(f"Queued {queued_count} messages for processing")
                 
     except Exception as e:
         logger.error(f"Xabarlarni tekshirishda xato: {e}")
         try:
             db_session.rollback()
-        except:
-            pass
+        except Exception as rollback_error:
+            logger.error(f"Rollback xato: {rollback_error}")
     finally:
         try:
             db_session.close()
-        except:
-            pass
+        except Exception as close_error:
+            logger.error(f"Session yopishda xato: {close_error}")
 
 async def send_scheduled_message_isolated(message_record):
     """Send scheduled message - COMPLETELY ISOLATED for true parallelism"""
@@ -221,8 +351,8 @@ async def send_scheduled_message_isolated(message_record):
             try:
                 clean_json = target_groups.replace("'", '"')
                 group_ids = json.loads(clean_json)
-            except:
-                pass
+            except Exception as json_error:
+                logger.warning(f"Failed to parse target_groups JSON: {json_error}")
         
         if not group_ids:
             user_groups = message_db_session.query(UserGroup).filter(
@@ -251,13 +381,25 @@ async def send_scheduled_message_isolated(message_record):
         user_api = TelegramAPI(api_id, api_hash, user.phone_number)
         
         # Send message
-        success, _ = await user_api.send_message_to_groups(
+        success, result_msg = await user_api.send_message_to_groups(
             user.phone_number, message_text, group_ids
         )
         
         if success:
-            current_message.is_sent = True
-            message_db_session.commit()
+            # For repeating messages, is_sent is already True (set when queued)
+            # For one-time messages, we keep it True
+            # For repeating messages that need to repeat, scheduler will reset is_sent
+            logger.info(f"Message {message_id} sent successfully: {result_msg}")
+        else:
+            # If failed, reset is_sent so it can be retried
+            if not current_message.is_repeat:
+                current_message.is_sent = False
+                message_db_session.commit()
+                logger.warning(f"Message {message_id} failed, will retry: {result_msg}")
+            else:
+                # For repeating messages, still mark as sent to avoid blocking
+                # The scheduler will handle the next cycle
+                logger.warning(f"Repeating message {message_id} failed but marked as sent: {result_msg}")
         
         return success
             
@@ -265,14 +407,14 @@ async def send_scheduled_message_isolated(message_record):
         logger.error(f"Send error for message {message_id}: {e}")
         try:
             message_db_session.rollback()
-        except:
-            pass
+        except Exception as rollback_error:
+            logger.error(f"Rollback error: {rollback_error}")
         return False
     finally:
         try:
             message_db_session.close()
-        except:
-            pass
+        except Exception as close_error:
+            logger.error(f"Session close error: {close_error}")
 
 # Keep old function for backward compatibility
 async def send_scheduled_message(message_record, db_session):
