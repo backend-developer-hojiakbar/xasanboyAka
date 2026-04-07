@@ -405,7 +405,7 @@ class TelegramAPI:
             
             logger.info(f"Connecting to Telegram for folders fetching: {phone_number}")
             
-            # Try to use existing authorized client first
+            # Try to use existing authorized client first (READ-ONLY mode for folders)
             if self.client and self.phone_number == phone_number:
                 try:
                     if self.client.is_connected():
@@ -416,9 +416,15 @@ class TelegramAPI:
                         client = self.client
                         logger.info(f"Reconnected existing client for {phone_number}")
                 except Exception as e:
-                    logger.warning(f"Failed to use existing client: {e}, creating new one")
-                    client = TelegramClient(session_file, self.api_id, self.api_hash)
-                    await client.connect()
+                    logger.warning(f"Failed to use existing client: {e}")
+                    # Don't create new client on readonly error, use existing one even if disconnected
+                    if "readonly" in str(e).lower():
+                        logger.info("Readonly database error - using existing client without reconnect")
+                        client = self.client
+                    else:
+                        logger.warning("Creating new client")
+                        client = TelegramClient(session_file, self.api_id, self.api_hash)
+                        await client.connect()
             else:
                 client = TelegramClient(session_file, self.api_id, self.api_hash)
                 await client.connect()
@@ -587,8 +593,26 @@ class TelegramAPI:
                         
                         for peer in include_peers:
                             try:
-                                # Get chat info
-                                chat = await client.get_entity(peer)
+                                # Get chat info - handle different peer types
+                                chat = None
+                                try:
+                                    chat = await client.get_entity(peer)
+                                except Exception as entity_error:
+                                    # Try to extract chat ID from peer and get entity by ID
+                                    try:
+                                        peer_id = None
+                                        if hasattr(peer, 'channel_id'):
+                                            peer_id = peer.channel_id
+                                            chat = await client.get_entity(peer_id)
+                                        elif hasattr(peer, 'chat_id'):
+                                            peer_id = peer.chat_id
+                                            chat = await client.get_entity(peer_id)
+                                        elif hasattr(peer, 'user_id'):
+                                            peer_id = peer.user_id
+                                            chat = await client.get_entity(peer_id)
+                                    except Exception as id_error:
+                                        logger.debug(f"Could not get entity by ID: {id_error}")
+                                
                                 if chat:
                                     chat_title = getattr(chat, 'title', str(chat.id))
                                     folder_data['groups'].append({
@@ -596,7 +620,7 @@ class TelegramAPI:
                                         'title': chat_title
                                     })
                             except Exception as e:
-                                logger.debug(f"Could not get entity for peer {peer}: {e}")
+                                logger.debug(f"Could not get entity for peer: {e}")
                                 continue
                         
                         folders.append(folder_data)
