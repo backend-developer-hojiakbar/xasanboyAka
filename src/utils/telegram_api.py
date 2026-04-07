@@ -406,26 +406,40 @@ class TelegramAPI:
             logger.info(f"Connecting to Telegram for folders fetching: {phone_number}")
             
             # Try to use existing authorized client first (READ-ONLY mode for folders)
+            client = None
             if self.client and self.phone_number == phone_number:
                 try:
                     if self.client.is_connected():
                         client = self.client
-                        logger.info(f"Using existing authorized client for {phone_number}")
+                        logger.info(f"Using existing connected client for {phone_number}")
                     else:
-                        await self.client.connect()
-                        client = self.client
-                        logger.info(f"Reconnected existing client for {phone_number}")
+                        # Try to reconnect, but handle readonly error
+                        try:
+                            await self.client.connect()
+                            client = self.client
+                            logger.info(f"Reconnected existing client for {phone_number}")
+                        except Exception as reconnect_error:
+                            if "readonly" in str(reconnect_error).lower():
+                                logger.warning("Readonly database on reconnect - creating in-memory client")
+                                # Create temporary in-memory client using same auth
+                                client = TelegramClient(None, self.api_id, self.api_hash)
+                                await client.connect()
+                                # Try to authorize with existing session data
+                                if await client.is_user_authorized():
+                                    logger.info("In-memory client authorized")
+                                else:
+                                    logger.warning("In-memory client not authorized")
+                                    await client.disconnect()
+                                    client = None
+                            else:
+                                raise
                 except Exception as e:
                     logger.warning(f"Failed to use existing client: {e}")
-                    # Don't create new client on readonly error, use existing one even if disconnected
-                    if "readonly" in str(e).lower():
-                        logger.info("Readonly database error - using existing client without reconnect")
-                        client = self.client
-                    else:
-                        logger.warning("Creating new client")
-                        client = TelegramClient(session_file, self.api_id, self.api_hash)
-                        await client.connect()
-            else:
+                    client = None
+            
+            # Create new client if needed
+            if not client:
+                logger.info("Creating new Telegram client")
                 client = TelegramClient(session_file, self.api_id, self.api_hash)
                 await client.connect()
             
@@ -591,27 +605,56 @@ class TelegramAPI:
                             except Exception as dialog_error:
                                 logger.error(f"Error fetching dialogs for folder {folder.id}: {dialog_error}")
                         
-                        for peer in include_peers:
+                        # Process peers in batches to avoid timeout
+                        batch_size = 10
+                        total_peers = len(include_peers)
+                        processed = 0
+                        
+                        for i, peer in enumerate(include_peers):
                             try:
                                 # Get chat info - handle different peer types
                                 chat = None
+                                
+                                # Try different methods to get the entity
                                 try:
+                                    # Method 1: Direct get_entity
                                     chat = await client.get_entity(peer)
-                                except Exception as entity_error:
-                                    # Try to extract chat ID from peer and get entity by ID
+                                except Exception:
+                                    # Method 2: Extract from InputDialogPeer
                                     try:
-                                        peer_id = None
-                                        if hasattr(peer, 'channel_id'):
-                                            peer_id = peer.channel_id
-                                            chat = await client.get_entity(peer_id)
-                                        elif hasattr(peer, 'chat_id'):
-                                            peer_id = peer.chat_id
-                                            chat = await client.get_entity(peer_id)
-                                        elif hasattr(peer, 'user_id'):
-                                            peer_id = peer.user_id
-                                            chat = await client.get_entity(peer_id)
-                                    except Exception as id_error:
-                                        logger.debug(f"Could not get entity by ID: {id_error}")
+                                        if hasattr(peer, 'peer'):
+                                            inner_peer = peer.peer
+                                            chat = await client.get_entity(inner_peer)
+                                    except Exception:
+                                        pass
+                                    
+                                    # Method 3: Extract ID from peer attributes
+                                    if not chat:
+                                        try:
+                                            peer_id = None
+                                            peer_type = None
+                                            
+                                            if hasattr(peer, 'channel_id'):
+                                                peer_id = peer.channel_id
+                                                peer_type = 'channel'
+                                            elif hasattr(peer, 'chat_id'):
+                                                peer_id = peer.chat_id
+                                                peer_type = 'chat'
+                                            elif hasattr(peer, 'user_id'):
+                                                peer_id = peer.user_id
+                                                peer_type = 'user'
+                                            
+                                            if peer_id:
+                                                # Construct proper peer object
+                                                from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+                                                if peer_type == 'channel':
+                                                    chat = await client.get_entity(PeerChannel(peer_id))
+                                                elif peer_type == 'chat':
+                                                    chat = await client.get_entity(PeerChat(peer_id))
+                                                elif peer_type == 'user':
+                                                    chat = await client.get_entity(PeerUser(peer_id))
+                                        except Exception:
+                                            pass
                                 
                                 if chat:
                                     chat_title = getattr(chat, 'title', str(chat.id))
@@ -619,9 +662,17 @@ class TelegramAPI:
                                         'id': str(chat.id),
                                         'title': chat_title
                                     })
+                                    processed += 1
+                                
+                                # Log progress every batch
+                                if (i + 1) % batch_size == 0:
+                                    logger.info(f"Processed {i + 1}/{total_peers} peers for folder {folder.id}")
+                                    
                             except Exception as e:
-                                logger.debug(f"Could not get entity for peer: {e}")
+                                logger.debug(f"Could not get entity for peer {i}: {e}")
                                 continue
+                        
+                        logger.info(f"Successfully processed {processed}/{total_peers} peers for folder {folder.id}")
                         
                         folders.append(folder_data)
                         # Safe logging for Unicode characters - ASCII only
