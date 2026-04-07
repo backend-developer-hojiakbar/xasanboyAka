@@ -341,6 +341,52 @@ class TelegramAPI:
                 except Exception as disconnect_error:
                     logger.error(f"Error disconnecting client: {disconnect_error}")
             
+    async def _get_virtual_folders_from_db(self, phone_number):
+        """Create virtual folders from database groups when not authorized"""
+        try:
+            from ..models.database import get_session, User, UserGroup
+            db_session = get_session()
+            try:
+                # Find user by phone number
+                user = db_session.query(User).filter(User.phone_number == phone_number).first()
+                if not user:
+                    logger.warning(f"User not found in database for phone: {phone_number}")
+                    return []
+                
+                # Get all active groups for this user
+                user_groups = db_session.query(UserGroup).filter(
+                    UserGroup.user_id == user.id,
+                    UserGroup.is_active == True
+                ).all()
+                
+                if not user_groups:
+                    logger.info(f"No groups found in database for user {user.id}")
+                    return []
+                
+                logger.info(f"Found {len(user_groups)} groups in database for user {user.id}")
+                
+                # Create a single virtual folder with all groups
+                virtual_folder = {
+                    'id': 9997,
+                    'title': '📁 Mening Guruhlarim',
+                    'groups': []
+                }
+                
+                for group in user_groups:
+                    virtual_folder['groups'].append({
+                        'id': str(group.group_id),
+                        'title': group.group_title or f"Group {group.group_id}"
+                    })
+                
+                logger.info(f"Created virtual folder with {len(virtual_folder['groups'])} groups from database")
+                return [virtual_folder]
+                
+            finally:
+                db_session.close()
+        except Exception as e:
+            logger.error(f"Error creating virtual folders from DB: {e}")
+            return []
+    
     async def get_user_folders(self, phone_number):
         """Get user's chat folders from Telegram"""
         if not self.is_valid_api:
@@ -359,13 +405,30 @@ class TelegramAPI:
             
             logger.info(f"Connecting to Telegram for folders fetching: {phone_number}")
             
-            client = TelegramClient(session_file, self.api_id, self.api_hash)
-            await client.connect()
+            # Try to use existing authorized client first
+            if self.client and self.phone_number == phone_number:
+                try:
+                    if self.client.is_connected():
+                        client = self.client
+                        logger.info(f"Using existing authorized client for {phone_number}")
+                    else:
+                        await self.client.connect()
+                        client = self.client
+                        logger.info(f"Reconnected existing client for {phone_number}")
+                except Exception as e:
+                    logger.warning(f"Failed to use existing client: {e}, creating new one")
+                    client = TelegramClient(session_file, self.api_id, self.api_hash)
+                    await client.connect()
+            else:
+                client = TelegramClient(session_file, self.api_id, self.api_hash)
+                await client.connect()
             
             is_authorized = await client.is_user_authorized()
             if not is_authorized:
                 logger.warning(f"User not authorized for {phone_number}")
-                return []
+                # Return empty but with helpful virtual folders based on database groups
+                logger.info(f"Attempting to create virtual folders from database groups for {phone_number}")
+                return await self._get_virtual_folders_from_db(phone_number)
             
             # Get dialog filters (folders) - try multiple methods
             filters_list = None
