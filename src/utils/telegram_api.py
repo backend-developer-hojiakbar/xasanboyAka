@@ -647,7 +647,9 @@ class TelegramAPI:
                                 logger.info(f"Peer {i} type: {type(peer).__name__}, attrs: {peer_attrs[:15]}")
                                 
                                 # Try different methods to get the entity
-                                m1_error = m2_error = m3_error = None
+                                m1_error = m2_error = m3_error = m4_error = None
+                                chat = None
+                                
                                 try:
                                     # Method 1: Direct get_entity
                                     chat = await client.get_entity(peer)
@@ -659,7 +661,7 @@ class TelegramAPI:
                                     try:
                                         if hasattr(peer, 'peer'):
                                             inner_peer = peer.peer
-                                            logger.info(f"Peer {i} has inner peer: {type(inner_peer).__name__}, attrs: {[a for a in dir(inner_peer) if not a.startswith('_')][:5]}")
+                                            logger.info(f"Peer {i} has inner peer: {type(inner_peer).__name__}")
                                             
                                             # Handle InputPeerChannel, InputPeerChat inside InputDialogPeer
                                             if hasattr(inner_peer, 'channel_id'):
@@ -711,8 +713,25 @@ class TelegramAPI:
                                         except Exception as e:
                                             m3_error = str(e)
                                 
+                                # Method 4: Use access_hash directly (bypass SQLite)
+                                if not chat and hasattr(peer, 'channel_id') and hasattr(peer, 'access_hash'):
+                                    try:
+                                        from telethon.tl.types import InputPeerChannel
+                                        channel_id = peer.channel_id
+                                        access_hash = peer.access_hash
+                                        logger.info(f"Method 4: Using access_hash for channel {channel_id}")
+                                        
+                                        # Create InputPeerChannel directly
+                                        input_peer = InputPeerChannel(channel_id, access_hash)
+                                        
+                                        # Try to get entity using the input peer directly
+                                        chat = await client.get_entity(input_peer)
+                                        logger.info(f"Method 4 success for peer {i}: {chat.title if hasattr(chat, 'title') else chat.id}")
+                                    except Exception as e:
+                                        m4_error = str(e)
+                                
                                 if not chat:
-                                    logger.warning(f"All methods failed for peer {i}: M1={m1_error}, M2={m2_error}, M3={m3_error}")
+                                    logger.warning(f"All methods failed for peer {i}: M1={m1_error}, M2={m2_error}, M3={m3_error}, M4={m4_error}")
                                 
                                 if chat:
                                     chat_title = getattr(chat, 'title', str(chat.id))
