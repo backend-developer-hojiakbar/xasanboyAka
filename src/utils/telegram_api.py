@@ -15,6 +15,10 @@ logger = setup_logging()
 _session_locks = {}
 _session_locks_lock = threading.Lock()
 
+# Global authorized clients storage (phone_number -> client)
+_authorized_clients = {}
+_authorized_clients_lock = threading.Lock()
+
 def get_session_lock(phone_number):
     """Get or create a lock for a specific phone number's session"""
     if not phone_number:
@@ -24,6 +28,26 @@ def get_session_lock(phone_number):
         if phone_clean not in _session_locks:
             _session_locks[phone_clean] = asyncio.Lock()
         return _session_locks[phone_clean]
+
+def store_authorized_client(phone_number, client):
+    """Store authorized client for reuse"""
+    if not phone_number or not client:
+        return
+    phone_clean = phone_number.replace('+', '')
+    with _authorized_clients_lock:
+        _authorized_clients[phone_clean] = client
+        logger.info(f"Stored authorized client for {phone_number}")
+
+def get_authorized_client(phone_number):
+    """Get stored authorized client if available"""
+    if not phone_number:
+        return None
+    phone_clean = phone_number.replace('+', '')
+    with _authorized_clients_lock:
+        client = _authorized_clients.get(phone_clean)
+        if client:
+            logger.info(f"Found stored authorized client for {phone_number}")
+        return client
 
 class TelegramAPI:
     def __init__(self, api_id, api_hash, phone_number=None):
@@ -257,6 +281,9 @@ class TelegramAPI:
             # Save client for future use
             self.client = client
             
+            # Store in global cache for reuse across requests
+            store_authorized_client(phone_number, client)
+            
             return True, user_info
             
         except ApiIdInvalidError:
@@ -407,37 +434,37 @@ class TelegramAPI:
             
             # Try to use existing authorized client first (READ-ONLY mode for folders)
             client = None
-            if self.client and self.phone_number == phone_number:
+            
+            # Method 1: Check global authorized clients cache
+            global_client = get_authorized_client(phone_number)
+            if global_client:
+                try:
+                    if global_client.is_connected():
+                        client = global_client
+                        logger.info(f"Using global authorized client for {phone_number}")
+                    else:
+                        await global_client.connect()
+                        client = global_client
+                        logger.info(f"Reconnected global client for {phone_number}")
+                except Exception as e:
+                    logger.warning(f"Failed to use global client: {e}")
+                    client = None
+            
+            # Method 2: Check instance client
+            if not client and self.client and self.phone_number == phone_number:
                 try:
                     if self.client.is_connected():
                         client = self.client
-                        logger.info(f"Using existing connected client for {phone_number}")
+                        logger.info(f"Using instance connected client for {phone_number}")
                     else:
-                        # Try to reconnect, but handle readonly error
-                        try:
-                            await self.client.connect()
-                            client = self.client
-                            logger.info(f"Reconnected existing client for {phone_number}")
-                        except Exception as reconnect_error:
-                            if "readonly" in str(reconnect_error).lower():
-                                logger.warning("Readonly database on reconnect - creating in-memory client")
-                                # Create temporary in-memory client using same auth
-                                client = TelegramClient(None, self.api_id, self.api_hash)
-                                await client.connect()
-                                # Try to authorize with existing session data
-                                if await client.is_user_authorized():
-                                    logger.info("In-memory client authorized")
-                                else:
-                                    logger.warning("In-memory client not authorized")
-                                    await client.disconnect()
-                                    client = None
-                            else:
-                                raise
+                        await self.client.connect()
+                        client = self.client
+                        logger.info(f"Reconnected instance client for {phone_number}")
                 except Exception as e:
-                    logger.warning(f"Failed to use existing client: {e}")
+                    logger.warning(f"Failed to use instance client: {e}")
                     client = None
             
-            # Create new client if needed
+            # Method 3: Create new client if needed
             if not client:
                 logger.info("Creating new Telegram client")
                 client = TelegramClient(session_file, self.api_id, self.api_hash)
