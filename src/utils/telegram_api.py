@@ -367,40 +367,105 @@ class TelegramAPI:
                 logger.warning(f"User not authorized for {phone_number}")
                 return []
             
-            # Get dialog filters (folders)
-            from telethon.tl.functions.messages import GetDialogFiltersRequest
-            result = await client(GetDialogFiltersRequest())
+            # Get dialog filters (folders) - try multiple methods
+            filters_list = None
             
-            logger.info(f"GetDialogFilters result type: {type(result)}")
+            # Method 1: GetDialogFiltersRequest
+            try:
+                from telethon.tl.functions.messages import GetDialogFiltersRequest
+                result = await client(GetDialogFiltersRequest())
+                logger.info(f"GetDialogFilters result type: {type(result)}")
+                
+                if hasattr(result, 'filters'):
+                    filters_list = result.filters
+                    logger.info(f"Method 1: Found {len(filters_list)} filters")
+                elif isinstance(result, list):
+                    filters_list = result
+                    logger.info(f"Method 1 (list): Found {len(filters_list)} filters")
+            except Exception as method1_error:
+                logger.warning(f"Method 1 failed: {method1_error}")
             
-            # Detailed debug logging
-            if hasattr(result, 'filters'):
-                logger.info(f"Number of filters: {len(result.filters)}")
-                for i, f in enumerate(result.filters):
-                    logger.info(f"Filter {i}: id={getattr(f, 'id', 'N/A')}, title={getattr(f, 'title', 'N/A')}")
-                    logger.info(f"Filter {i} attributes: {dir(f)}")
-                    # Check for different peer attributes
-                    for attr in ['include_peers', 'pinned_peers', 'include', 'exclude_peers', 'emoticon', 'color']:
-                        if hasattr(f, attr):
-                            val = getattr(f, attr)
-                            logger.info(f"Filter {i}.{attr}: {len(val) if hasattr(val, '__len__') else val}")
-            else:
-                logger.info(f"Result attributes: {dir(result)}")
+            # Method 2: Try getting all dialogs and creating virtual folders
+            if not filters_list:
+                logger.info("Trying Method 2: Getting all dialogs...")
+                try:
+                    all_dialogs = await client.get_dialogs()
+                    logger.info(f"Found {len(all_dialogs)} total dialogs")
+                    
+                    # Create virtual folders based on dialog types
+                    groups = []
+                    channels = []
+                    
+                    for dialog in all_dialogs:
+                        try:
+                            if dialog.is_group:
+                                groups.append(dialog)
+                            elif dialog.is_channel:
+                                channels.append(dialog)
+                        except:
+                            pass
+                    
+                    logger.info(f"Groups: {len(groups)}, Channels: {len(channels)}")
+                    
+                    # Create virtual folder list
+                    virtual_folders = []
+                    if groups:
+                        virtual_folders.append({
+                            'id': 9998,
+                            'title': '📁 Barcha Guruhlar',
+                            'groups': groups,
+                            'is_virtual': True
+                        })
+                    if channels:
+                        virtual_folders.append({
+                            'id': 9999,
+                            'title': '📢 Barcha Kanallar',
+                            'groups': channels,
+                            'is_virtual': True
+                        })
+                    
+                    if virtual_folders:
+                        logger.info(f"Created {len(virtual_folders)} virtual folders")
+                        return virtual_folders
+                        
+                except Exception as method2_error:
+                    logger.warning(f"Method 2 failed: {method2_error}")
+            
+            if not filters_list:
+                logger.warning("No folders found with any method")
+                return []
             
             folders = []
-            
-            # Handle different response formats
-            filters_list = None
-            if hasattr(result, 'filters'):
-                filters_list = result.filters
-            elif isinstance(result, list):
-                filters_list = result
-            elif hasattr(result, '__iter__'):
-                filters_list = list(result)
             
             if filters_list:
                 for folder in filters_list:
                     try:
+                        # Handle virtual folders (from Method 2)
+                        if isinstance(folder, dict) and folder.get('is_virtual'):
+                            folder_data = {
+                                'id': folder['id'],
+                                'title': folder['title'],
+                                'groups': []
+                            }
+                            # Process virtual folder groups
+                            for dialog in folder['groups']:
+                                try:
+                                    chat = await client.get_entity(dialog.input_entity)
+                                    if chat:
+                                        chat_title = getattr(chat, 'title', str(chat.id))
+                                        folder_data['groups'].append({
+                                            'id': str(chat.id),
+                                            'title': chat_title
+                                        })
+                                except Exception as e:
+                                    logger.debug(f"Could not get entity for dialog: {e}")
+                                    continue
+                            
+                            folders.append(folder_data)
+                            safe_title = folder['title'].encode('ascii', 'replace').decode('ascii') if folder['title'] else '[No title]'
+                            logger.info(f"Found virtual folder: {safe_title} with {len(folder_data['groups'])} groups")
+                            continue
+                        
                         # Skip if not a dialog filter
                         if not hasattr(folder, 'id'):
                             continue

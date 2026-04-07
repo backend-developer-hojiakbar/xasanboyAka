@@ -398,7 +398,12 @@ async def show_telegram_folders(update: Update, context: ContextTypes.DEFAULT_TY
     
     try:
         # Get folders from Telegram
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Fetching folders for phone: {phone_number}")
+        
         folders = await verifier.get_user_folders(phone_number)
+        logger.info(f"Folders result: {folders}")
         
         if not folders:
             message = (
