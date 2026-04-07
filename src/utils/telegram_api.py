@@ -643,40 +643,42 @@ class TelegramAPI:
                                 chat = None
                                 
                                 # Debug: Log peer type
-                                logger.debug(f"Peer {i} type: {type(peer).__name__}, attrs: {[a for a in dir(peer) if not a.startswith('_')][:10]}")
+                                peer_attrs = [a for a in dir(peer) if not a.startswith('_') and not callable(getattr(peer, a, None))]
+                                logger.info(f"Peer {i} type: {type(peer).__name__}, attrs: {peer_attrs[:15]}")
                                 
                                 # Try different methods to get the entity
+                                m1_error = m2_error = m3_error = None
                                 try:
                                     # Method 1: Direct get_entity
                                     chat = await client.get_entity(peer)
-                                    logger.debug(f"Method 1 success for peer {i}")
-                                except Exception as m1_error:
-                                    logger.debug(f"Method 1 failed for peer {i}: {m1_error}")
+                                    logger.info(f"Method 1 success for peer {i}: {chat.title if hasattr(chat, 'title') else chat.id}")
+                                except Exception as e:
+                                    m1_error = str(e)
                                     
                                     # Method 2: Extract from InputDialogPeer (most common for folders)
                                     try:
                                         if hasattr(peer, 'peer'):
                                             inner_peer = peer.peer
-                                            logger.debug(f"Peer {i} has inner peer: {type(inner_peer).__name__}")
+                                            logger.info(f"Peer {i} has inner peer: {type(inner_peer).__name__}, attrs: {[a for a in dir(inner_peer) if not a.startswith('_')][:5]}")
                                             
                                             # Handle InputPeerChannel, InputPeerChat inside InputDialogPeer
                                             if hasattr(inner_peer, 'channel_id'):
                                                 from telethon.tl.types import PeerChannel
                                                 chat = await client.get_entity(PeerChannel(inner_peer.channel_id))
-                                                logger.debug(f"Method 2a (PeerChannel) success for peer {i}")
+                                                logger.info(f"Method 2a (PeerChannel) success for peer {i}: {chat.title}")
                                             elif hasattr(inner_peer, 'chat_id'):
                                                 from telethon.tl.types import PeerChat
                                                 chat = await client.get_entity(PeerChat(inner_peer.chat_id))
-                                                logger.debug(f"Method 2b (PeerChat) success for peer {i}")
+                                                logger.info(f"Method 2b (PeerChat) success for peer {i}: {chat.title}")
                                             elif hasattr(inner_peer, 'user_id'):
                                                 from telethon.tl.types import PeerUser
                                                 chat = await client.get_entity(PeerUser(inner_peer.user_id))
-                                                logger.debug(f"Method 2c (PeerUser) success for peer {i}")
+                                                logger.info(f"Method 2c (PeerUser) success for peer {i}")
                                             else:
                                                 chat = await client.get_entity(inner_peer)
-                                                logger.debug(f"Method 2d (direct) success for peer {i}")
-                                    except Exception as m2_error:
-                                        logger.debug(f"Method 2 failed for peer {i}: {m2_error}")
+                                                logger.info(f"Method 2d (direct) success for peer {i}")
+                                    except Exception as e:
+                                        m2_error = str(e)
                                     
                                     # Method 3: Extract ID from peer attributes
                                     if not chat:
@@ -688,17 +690,15 @@ class TelegramAPI:
                                             if hasattr(peer, 'channel_id'):
                                                 peer_id = peer.channel_id
                                                 peer_type = 'channel'
-                                                logger.debug(f"Peer {i} is channel with ID: {peer_id}")
                                             elif hasattr(peer, 'chat_id'):
                                                 peer_id = peer.chat_id
                                                 peer_type = 'chat'
-                                                logger.debug(f"Peer {i} is chat with ID: {peer_id}")
                                             elif hasattr(peer, 'user_id'):
                                                 peer_id = peer.user_id
                                                 peer_type = 'user'
-                                                logger.debug(f"Peer {i} is user with ID: {peer_id}")
                                             
                                             if peer_id:
+                                                logger.info(f"Peer {i} is {peer_type} with ID: {peer_id}")
                                                 # Construct proper peer object
                                                 from telethon.tl.types import PeerChannel, PeerChat, PeerUser
                                                 if peer_type == 'channel':
@@ -707,9 +707,12 @@ class TelegramAPI:
                                                     chat = await client.get_entity(PeerChat(peer_id))
                                                 elif peer_type == 'user':
                                                     chat = await client.get_entity(PeerUser(peer_id))
-                                                logger.debug(f"Method 3 success for peer {i}")
-                                        except Exception as m3_error:
-                                            logger.debug(f"Method 3 failed for peer {i}: {m3_error}")
+                                                logger.info(f"Method 3 success for peer {i}: {chat.title if hasattr(chat, 'title') else chat.id}")
+                                        except Exception as e:
+                                            m3_error = str(e)
+                                
+                                if not chat:
+                                    logger.warning(f"All methods failed for peer {i}: M1={m1_error}, M2={m2_error}, M3={m3_error}")
                                 
                                 if chat:
                                     chat_title = getattr(chat, 'title', str(chat.id))
