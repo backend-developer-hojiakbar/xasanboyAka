@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import threading
+from contextlib import asynccontextmanager
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError, PhoneCodeInvalidError, ApiIdInvalidError
 from telethon.tl.functions.messages import ImportChatInviteRequest
@@ -10,6 +11,7 @@ from datetime import datetime
 from src.utils.helpers import setup_logging
 
 logger = setup_logging()
+ENTITY_CACHE_LIMIT = 10000
 
 # Global session locks to prevent concurrent access to same session file
 _session_locks = {}
@@ -28,6 +30,28 @@ def get_session_lock(phone_number):
         if phone_clean not in _session_locks:
             _session_locks[phone_clean] = asyncio.Lock()
         return _session_locks[phone_clean]
+
+@asynccontextmanager
+async def session_access(phone_number, timeout=30.0):
+    """Serialize access to the same Telethon session file."""
+    session_lock = get_session_lock(phone_number)
+    if not session_lock:
+        yield
+        return
+
+    try:
+        await asyncio.wait_for(session_lock.acquire(), timeout=timeout)
+        logger.info(f"Session lock acquired for {phone_number}")
+    except asyncio.TimeoutError:
+        logger.error(f"Could not acquire session lock for {phone_number} within {timeout} seconds")
+        raise
+
+    try:
+        yield
+    finally:
+        if session_lock.locked():
+            session_lock.release()
+            logger.info(f"Session lock released for {phone_number}")
 
 def store_authorized_client(phone_number, client):
     """Store authorized client for reuse"""
@@ -68,7 +92,12 @@ class TelegramAPI:
         try:
             # Always create new client without session file
             logger.info(f"Creating new Telegram client for {self.phone_number}")
-            self.client = TelegramClient(None, self.api_id, self.api_hash)  # No session file
+            self.client = TelegramClient(
+                None,
+                self.api_id,
+                self.api_hash,
+                entity_cache_limit=ENTITY_CACHE_LIMIT
+            )  # No session file
             
             # Start with phone number to avoid interactive input
             if self.phone_number:
@@ -102,111 +131,117 @@ class TelegramAPI:
             return False, "API credentials are invalid. Please update your TELEGRAM_API_ID and TELEGRAM_API_HASH in .env file."
             
         try:
+            async with session_access(phone_number):
             # Create session file name for this phone number
-            import os
-            sessions_dir = 'sessions'
-            if not os.path.exists(sessions_dir):
-                os.makedirs(sessions_dir)
-            
-            session_file = f"{sessions_dir}/{phone_number.replace('+', '')}_session"
-            logger.info(f"[DEBUG] Session file: {session_file}")
-            
-            # Create new client with session file
-            self.phone_number = phone_number
-            logger.info(f"[DEBUG] Creating TelegramClient with api_id={self.api_id}, api_hash={self.api_hash[:5]}...")
-            
-            self.client = TelegramClient(session_file, self.api_id, self.api_hash)
-            logger.info("[DEBUG] TelegramClient created successfully")
-            
-            # Connect first before sending code
-            logger.info("[DEBUG] Connecting to Telegram...")
-            await self.client.connect()
-            logger.info("[DEBUG] Connected to Telegram successfully")
-            
-            # Check if already authorized (session exists)
-            logger.info("[DEBUG] Checking if user is already authorized...")
-            is_authorized = await self.client.is_user_authorized()
-            logger.info(f"[DEBUG] is_user_authorized: {is_authorized}")
-            
-            if is_authorized:
-                logger.info(f"[DEBUG] User {phone_number} already authorized")
-                return True, "already_authorized"
-            
-            # Send code request using raw API to ensure SMS delivery
-            logger.info(f"[DEBUG] Sending code request to {phone_number} via raw API...")
-            try:
-                from telethon.tl.functions.auth import SendCodeRequest
-                from telethon.tl.types import CodeSettings
+                import os
+                sessions_dir = 'sessions'
+                if not os.path.exists(sessions_dir):
+                    os.makedirs(sessions_dir)
                 
-                # Force SMS delivery by disabling app-based delivery
-                # This ensures code comes via SMS, not just Telegram app
-                code_settings = CodeSettings(
-                    allow_flashcall=False,
-                    current_number=False,
-                    allow_app_hash=False,  # Disable app hash to force SMS
-                    allow_missed_call=False
+                session_file = f"{sessions_dir}/{phone_number.replace('+', '')}_session"
+                logger.info(f"[DEBUG] Session file: {session_file}")
+                
+                # Create new client with session file
+                self.phone_number = phone_number
+                logger.info(f"[DEBUG] Creating TelegramClient with api_id={self.api_id}, api_hash={self.api_hash[:5]}...")
+                
+                self.client = TelegramClient(
+                    session_file,
+                    self.api_id,
+                    self.api_hash,
+                    entity_cache_limit=ENTITY_CACHE_LIMIT
                 )
+                logger.info("[DEBUG] TelegramClient created successfully")
                 
-                # Send code request directly via API
-                # api_id must be integer, not string
-                api_id_int = int(self.api_id) if isinstance(self.api_id, str) else self.api_id
+                # Connect first before sending code
+                logger.info("[DEBUG] Connecting to Telegram...")
+                await self.client.connect()
+                logger.info("[DEBUG] Connected to Telegram successfully")
                 
-                result = await self.client(SendCodeRequest(
-                    phone_number=phone_number,
-                    api_id=api_id_int,
-                    api_hash=self.api_hash,
-                    settings=code_settings
-                ))
+                # Check if already authorized (session exists)
+                logger.info("[DEBUG] Checking if user is already authorized...")
+                is_authorized = await self.client.is_user_authorized()
+                logger.info(f"[DEBUG] is_user_authorized: {is_authorized}")
                 
-                logger.info(f"[DEBUG] SendCodeRequest result type: {type(result)}")
-                logger.info(f"[DEBUG] SendCodeRequest result: {result}")
+                if is_authorized:
+                    logger.info(f"[DEBUG] User {phone_number} already authorized")
+                    return True, "already_authorized"
                 
-                if hasattr(result, 'phone_code_hash'):
-                    self.phone_code_hash = result.phone_code_hash
-                    logger.info(f"[DEBUG] phone_code_hash received: {result.phone_code_hash}")
-                else:
-                    logger.error(f"[DEBUG] No phone_code_hash in result! Result attributes: {dir(result)}")
-                    return False, "Failed to get phone_code_hash from Telegram"
+                # Send code request using raw API to ensure SMS delivery
+                logger.info(f"[DEBUG] Sending code request to {phone_number} via raw API...")
+                try:
+                    from telethon.tl.functions.auth import SendCodeRequest
+                    from telethon.tl.types import CodeSettings
+                    
+                    # Force SMS delivery by disabling app-based delivery
+                    # This ensures code comes via SMS, not just Telegram app
+                    code_settings = CodeSettings(
+                        allow_flashcall=False,
+                        current_number=False,
+                        allow_app_hash=False,  # Disable app hash to force SMS
+                        allow_missed_call=False
+                    )
+                    
+                    # Send code request directly via API
+                    # api_id must be integer, not string
+                    api_id_int = int(self.api_id) if isinstance(self.api_id, str) else self.api_id
+                    
+                    result = await self.client(SendCodeRequest(
+                        phone_number=phone_number,
+                        api_id=api_id_int,
+                        api_hash=self.api_hash,
+                        settings=code_settings
+                    ))
+                    
+                    logger.info(f"[DEBUG] SendCodeRequest result type: {type(result)}")
+                    logger.info(f"[DEBUG] SendCodeRequest result: {result}")
+                    
+                    if hasattr(result, 'phone_code_hash'):
+                        self.phone_code_hash = result.phone_code_hash
+                        logger.info(f"[DEBUG] phone_code_hash received: {result.phone_code_hash}")
+                    else:
+                        logger.error(f"[DEBUG] No phone_code_hash in result! Result attributes: {dir(result)}")
+                        return False, "Failed to get phone_code_hash from Telegram"
+                    
+                    # Check delivery type
+                    delivery_type = "Unknown"
+                    if hasattr(result, 'type'):
+                        type_str = str(type(result.type))
+                        logger.info(f"[DEBUG] Code delivery type: {result.type}")
+                        if 'SentCodeTypeApp' in type_str:
+                            delivery_type = "Telegram App"
+                            logger.warning(f"[DEBUG] Code sent via APP only. User must check Telegram app.")
+                        elif 'SentCodeTypeSms' in type_str:
+                            delivery_type = "SMS"
+                            logger.info(f"[DEBUG] Code sent via SMS to {phone_number}")
+                        elif 'SentCodeTypeCall' in type_str:
+                            delivery_type = "Phone Call"
+                            logger.info(f"[DEBUG] Code will be delivered via phone call")
+                    
+                    # Check for next_type (SMS fallback)
+                    if hasattr(result, 'next_type'):
+                        logger.info(f"[DEBUG] Next type (fallback): {result.next_type}")
+                    
+                    # Check for timeout
+                    if hasattr(result, 'timeout'):
+                        logger.info(f"[DEBUG] Timeout: {result.timeout}")
+                    
+                    # Check for terms of service
+                    if hasattr(result, 'terms_of_service'):
+                        logger.info(f"[DEBUG] Terms of service: {result.terms_of_service}")
+                    
+                    logger.info(f"[DEBUG] Verification code sent successfully to {phone_number} via {delivery_type}")
+                    
+                except Exception as send_error:
+                    logger.error(f"[DEBUG] send_code_request failed: {type(send_error).__name__}: {send_error}")
+                    import traceback
+                    logger.error(f"[DEBUG] Traceback: {traceback.format_exc()}")
+                    return False, f"send_code_request failed: {send_error}"
                 
-                # Check delivery type
-                delivery_type = "Unknown"
-                if hasattr(result, 'type'):
-                    type_str = str(type(result.type))
-                    logger.info(f"[DEBUG] Code delivery type: {result.type}")
-                    if 'SentCodeTypeApp' in type_str:
-                        delivery_type = "Telegram App"
-                        logger.warning(f"[DEBUG] Code sent via APP only. User must check Telegram app.")
-                    elif 'SentCodeTypeSms' in type_str:
-                        delivery_type = "SMS"
-                        logger.info(f"[DEBUG] Code sent via SMS to {phone_number}")
-                    elif 'SentCodeTypeCall' in type_str:
-                        delivery_type = "Phone Call"
-                        logger.info(f"[DEBUG] Code will be delivered via phone call")
+                # Keep connection alive for verification step
+                logger.info("[DEBUG] Keeping connection alive for verify_code")
                 
-                # Check for next_type (SMS fallback)
-                if hasattr(result, 'next_type'):
-                    logger.info(f"[DEBUG] Next type (fallback): {result.next_type}")
-                
-                # Check for timeout
-                if hasattr(result, 'timeout'):
-                    logger.info(f"[DEBUG] Timeout: {result.timeout}")
-                
-                # Check for terms of service
-                if hasattr(result, 'terms_of_service'):
-                    logger.info(f"[DEBUG] Terms of service: {result.terms_of_service}")
-                
-                logger.info(f"[DEBUG] Verification code sent successfully to {phone_number} via {delivery_type}")
-                
-            except Exception as send_error:
-                logger.error(f"[DEBUG] send_code_request failed: {type(send_error).__name__}: {send_error}")
-                import traceback
-                logger.error(f"[DEBUG] Traceback: {traceback.format_exc()}")
-                return False, f"send_code_request failed: {send_error}"
-            
-            # Keep connection alive for verification step
-            logger.info("[DEBUG] Keeping connection alive for verify_code")
-            
-            return True, self.phone_code_hash
+                return True, self.phone_code_hash
             
         except ApiIdInvalidError as e:
             logger.error(f"[DEBUG] API ID/Hash is invalid: {e}")
@@ -235,56 +270,82 @@ class TelegramAPI:
         created_new_client = False
         
         try:
+            async with session_access(phone_number):
             # Use the provided phone_code_hash or stored one
-            if not phone_code_hash and self.phone_code_hash:
-                phone_code_hash = self.phone_code_hash
-            
-            # If no existing client, create new one
-            if not client:
-                import os
-                sessions_dir = 'sessions'
-                if not os.path.exists(sessions_dir):
-                    os.makedirs(sessions_dir)
+                if not phone_code_hash and self.phone_code_hash:
+                    phone_code_hash = self.phone_code_hash
                 
-                session_file = f"{sessions_dir}/{phone_number.replace('+', '')}_session"
-                client = TelegramClient(session_file, self.api_id, self.api_hash)
-                await client.connect()
-                created_new_client = True
-            
-            # Ensure we're connected
-            if not client.is_connected():
-                await client.connect()
-            
-            try:
-                # Sign in with code
-                result = await client.sign_in(phone_number, code, phone_code_hash=phone_code_hash)
-            except SessionPasswordNeededError:
-                # 2FA is enabled, need password
-                if two_fa_password:
-                    # Try to sign in with 2FA password
-                    result = await client.sign_in(password=two_fa_password)
-                else:
-                    # Return special status indicating 2FA is needed
-                    return False, "2FA_REQUIRED"
-            
-            # Get user info
-            me = await client.get_me()
-            user_info = {
-                'first_name': me.first_name,
-                'last_name': me.last_name,
-                'username': me.username,
-                'phone': me.phone
-            }
-            
-            logger.info(f"User verified: {user_info}")
-            
-            # Save client for future use
-            self.client = client
-            
-            # Store in global cache for reuse across requests
-            store_authorized_client(phone_number, client)
-            
-            return True, user_info
+                # If no existing client, create new one
+                if not client:
+                    import os
+                    sessions_dir = 'sessions'
+                    if not os.path.exists(sessions_dir):
+                        os.makedirs(sessions_dir)
+                    
+                    session_file = f"{sessions_dir}/{phone_number.replace('+', '')}_session"
+                    client = TelegramClient(
+                        session_file, 
+                        self.api_id, 
+                        self.api_hash,
+                        request_retries=3,
+                        connection_retries=3,
+                        flood_sleep_threshold=60,
+                        entity_cache_limit=ENTITY_CACHE_LIMIT
+                    )
+                    try:
+                        client.session._db.execute("PRAGMA journal_mode=WAL")
+                        client.session._db.execute("PRAGMA busy_timeout=5000")
+                    except:
+                        pass
+                    await client.connect()
+                    created_new_client = True
+                
+                # Ensure we're connected
+                if not client.is_connected():
+                    await client.connect()
+                
+                try:
+                    # Sign in with code
+                    result = await client.sign_in(phone_number, code, phone_code_hash=phone_code_hash)
+                except SessionPasswordNeededError:
+                    # 2FA is enabled, need password
+                    if two_fa_password:
+                        # Try to sign in with 2FA password
+                        result = await client.sign_in(password=two_fa_password)
+                    else:
+                        # Return special status indicating 2FA is needed
+                        return False, "2FA_REQUIRED"
+                
+                # Get user info
+                me = await client.get_me()
+                user_info = {
+                    'first_name': me.first_name,
+                    'last_name': me.last_name,
+                    'username': me.username,
+                    'phone': me.phone
+                }
+                
+                logger.info(f"User verified: {user_info}")
+
+                # Force a graceful reconnect cycle so Telethon persists auth state
+                # to the session database before later folder/group fetches.
+                try:
+                    if client.is_connected():
+                        await client.disconnect()
+                    await client.connect()
+                    logger.info(f"Session persisted and reconnected for {phone_number}")
+                except Exception as persist_err:
+                    logger.warning(
+                        f"Session persist reconnect failed for {phone_number}: {persist_err}"
+                    )
+
+                # Save client for future use
+                self.client = client
+
+                # Store in global cache for reuse across requests
+                store_authorized_client(phone_number, client)
+
+                return True, user_info
             
         except ApiIdInvalidError:
             logger.error("API ID/Hash is invalid")
@@ -309,48 +370,75 @@ class TelegramAPI:
             return []
             
         client = None
+        using_cached_client = False
         try:
+            async with session_access(phone_number):
             # Create session file name for this phone number
-            import os
-            sessions_dir = 'sessions'
-            if not os.path.exists(sessions_dir):
-                os.makedirs(sessions_dir)
-            
-            phone_clean = phone_number.replace('+', '')
-            session_file = f"{sessions_dir}/{phone_clean}_session"
-            
-            logger.info(f"Connecting to Telegram for groups fetching: {phone_number} (session: {session_file})")
-            
-            # Create new client with session file
-            client = TelegramClient(session_file, self.api_id, self.api_hash)
-            
-            # Connect and start
-            await client.connect()
-            
-            is_authorized = await client.is_user_authorized()
-            if not is_authorized:
-                logger.warning(f"User not authorized for {phone_number}, session may be invalid or expired")
-                return []
-            
-            logger.info(f"User {phone_number} is authorized, fetching dialogs...")
-            
-            # Get dialogs (chats, groups, channels)
-            dialogs = await client.get_dialogs()
-            logger.info(f"Total dialogs found for {phone_number}: {len(dialogs)}")
-            
-            groups = []
-            for dialog in dialogs:
-                # Check for groups and channels
-                if dialog.is_group or dialog.is_channel:
-                    group_type = 'channel' if dialog.is_channel else 'group'
-                    groups.append({
-                        'id': str(dialog.entity.id),
-                        'title': dialog.entity.title,
-                        'type': group_type
-                    })
-            
-            logger.info(f"Filtered {len(groups)} groups/channels for {phone_number}")
-            return groups
+                import os
+                sessions_dir = 'sessions'
+                if not os.path.exists(sessions_dir):
+                    os.makedirs(sessions_dir)
+                
+                phone_clean = phone_number.replace('+', '')
+                session_file = f"{sessions_dir}/{phone_clean}_session"
+                
+                logger.info(f"Connecting to Telegram for groups fetching: {phone_number} (session: {session_file})")
+
+                # Prefer existing authorized client to avoid concurrent sqlite writers.
+                cached_client = get_authorized_client(phone_number)
+                if cached_client:
+                    client = cached_client
+                    using_cached_client = True
+                    if not client.is_connected():
+                        await client.connect()
+                else:
+                    # Create new client with session file and SQLite optimizations
+                    client = TelegramClient(
+                        session_file, 
+                        self.api_id, 
+                        self.api_hash,
+                        # Prevent database locked errors
+                        request_retries=3,
+                        connection_retries=3,
+                        flood_sleep_threshold=60,
+                        entity_cache_limit=ENTITY_CACHE_LIMIT
+                    )
+                    
+                    # Set SQLite WAL mode and timeout to prevent database locked
+                    import sqlite3
+                    try:
+                        client.session._db.execute("PRAGMA journal_mode=WAL")
+                        client.session._db.execute("PRAGMA busy_timeout=5000")
+                    except Exception as db_err:
+                        logger.debug(f"Could not set SQLite PRAGMA: {db_err}")
+                    
+                    # Connect and start
+                    await client.connect()
+                
+                is_authorized = await client.is_user_authorized()
+                if not is_authorized:
+                    logger.warning(f"User not authorized for {phone_number}, session may be invalid or expired")
+                    return []
+                
+                logger.info(f"User {phone_number} is authorized, fetching dialogs...")
+                
+                # Get dialogs (chats, groups, channels)
+                dialogs = await client.get_dialogs()
+                logger.info(f"Total dialogs found for {phone_number}: {len(dialogs)}")
+                
+                groups = []
+                for dialog in dialogs:
+                    # Check for groups and channels
+                    if dialog.is_group or dialog.is_channel:
+                        group_type = 'channel' if dialog.is_channel else 'group'
+                        groups.append({
+                            'id': str(dialog.entity.id),
+                            'title': dialog.entity.title,
+                            'type': group_type
+                        })
+                
+                logger.info(f"Filtered {len(groups)} groups/channels for {phone_number}")
+                return groups
         except ApiIdInvalidError:
             logger.error("API ID/Hash is invalid")
             self.is_valid_api = False
@@ -361,7 +449,7 @@ class TelegramAPI:
             logger.error(traceback.format_exc())
             return []
         finally:
-            if client:
+            if client and not using_cached_client:
                 try:
                     await client.disconnect()
                     logger.info(f"Disconnected Telegram client for {phone_number}")
@@ -421,61 +509,115 @@ class TelegramAPI:
             return []
             
         client = None
+        using_cached_client = False
         try:
-            import os
-            sessions_dir = 'sessions'
-            if not os.path.exists(sessions_dir):
-                os.makedirs(sessions_dir)
+            async with session_access(phone_number):
+                import os
+                sessions_dir = 'sessions'
+                if not os.path.exists(sessions_dir):
+                    os.makedirs(sessions_dir)
+                
+                phone_clean = phone_number.replace('+', '')
+                session_file = f"{sessions_dir}/{phone_clean}_session"
+                
+                logger.info(f"Connecting to Telegram for folders fetching: {phone_number}")
+                
+                # Try to use existing authorized client first (READ-ONLY mode for folders)
+                client = None
+                
+                # Method 1: Check global authorized clients cache
+                global_client = get_authorized_client(phone_number)
+                if global_client:
+                    try:
+                        if global_client.is_connected():
+                            client = global_client
+                            using_cached_client = True
+                            logger.info(f"Using global authorized client for {phone_number}")
+                        else:
+                            await global_client.connect()
+                            client = global_client
+                            using_cached_client = True
+                            logger.info(f"Reconnected global client for {phone_number}")
+                    except Exception as e:
+                        logger.warning(f"Failed to use global client: {e}")
+                        client = None
             
-            phone_clean = phone_number.replace('+', '')
-            session_file = f"{sessions_dir}/{phone_clean}_session"
+                # Method 2: Check instance client
+                if not client and self.client and self.phone_number == phone_number:
+                    try:
+                        if self.client.is_connected():
+                            client = self.client
+                            using_cached_client = True
+                            logger.info(f"Using instance connected client for {phone_number}")
+                        else:
+                            await self.client.connect()
+                            client = self.client
+                            using_cached_client = True
+                            logger.info(f"Reconnected instance client for {phone_number}")
+                    except Exception as e:
+                        logger.warning(f"Failed to use instance client: {e}")
+                        client = None
             
-            logger.info(f"Connecting to Telegram for folders fetching: {phone_number}")
-            
-            # Try to use existing authorized client first (READ-ONLY mode for folders)
-            client = None
-            
-            # Method 1: Check global authorized clients cache
-            global_client = get_authorized_client(phone_number)
-            if global_client:
-                try:
-                    if global_client.is_connected():
-                        client = global_client
-                        logger.info(f"Using global authorized client for {phone_number}")
-                    else:
-                        await global_client.connect()
-                        client = global_client
-                        logger.info(f"Reconnected global client for {phone_number}")
-                except Exception as e:
-                    logger.warning(f"Failed to use global client: {e}")
-                    client = None
-            
-            # Method 2: Check instance client
-            if not client and self.client and self.phone_number == phone_number:
-                try:
-                    if self.client.is_connected():
-                        client = self.client
-                        logger.info(f"Using instance connected client for {phone_number}")
-                    else:
-                        await self.client.connect()
-                        client = self.client
-                        logger.info(f"Reconnected instance client for {phone_number}")
-                except Exception as e:
-                    logger.warning(f"Failed to use instance client: {e}")
-                    client = None
-            
-            # Method 3: Create new client if needed
-            if not client:
-                logger.info("Creating new Telegram client")
-                client = TelegramClient(session_file, self.api_id, self.api_hash)
-                await client.connect()
-            
-            is_authorized = await client.is_user_authorized()
-            if not is_authorized:
-                logger.warning(f"User not authorized for {phone_number}")
-                # Return empty but with helpful virtual folders based on database groups
-                logger.info(f"Attempting to create virtual folders from database groups for {phone_number}")
-                return await self._get_virtual_folders_from_db(phone_number)
+                # Method 3: Create new client if needed
+                if not client:
+                    logger.info("Creating new Telegram client")
+                    client = TelegramClient(
+                        session_file, 
+                        self.api_id, 
+                        self.api_hash,
+                        request_retries=3,
+                        connection_retries=3,
+                        flood_sleep_threshold=60,
+                        entity_cache_limit=ENTITY_CACHE_LIMIT
+                    )
+                    try:
+                        client.session._db.execute("PRAGMA journal_mode=WAL")
+                        client.session._db.execute("PRAGMA busy_timeout=5000")
+                    except:
+                        pass
+                    await client.connect()
+                
+                is_authorized = await client.is_user_authorized()
+                if not is_authorized:
+                    logger.warning(f"User not authorized for {phone_number}")
+                    # Retry once with a fresh client instance before giving up.
+                    try:
+                        if client and not using_cached_client:
+                            await client.disconnect()
+                    except Exception:
+                        pass
+
+                    retry_client = None
+                    try:
+                        retry_client = TelegramClient(
+                            session_file,
+                            self.api_id,
+                            self.api_hash,
+                            request_retries=3,
+                            connection_retries=3,
+                            flood_sleep_threshold=60,
+                            entity_cache_limit=ENTITY_CACHE_LIMIT
+                        )
+                        try:
+                            retry_client.session._db.execute("PRAGMA journal_mode=WAL")
+                            retry_client.session._db.execute("PRAGMA busy_timeout=5000")
+                        except Exception:
+                            pass
+                        await retry_client.connect()
+                        retry_auth = await retry_client.is_user_authorized()
+                        if retry_auth:
+                            client = retry_client
+                            using_cached_client = False
+                            logger.info(f"Authorization recovered on retry for {phone_number}")
+                        else:
+                            logger.warning(f"Still unauthorized after retry for {phone_number}")
+                            return []
+                    finally:
+                        if retry_client and retry_client is not client:
+                            try:
+                                await retry_client.disconnect()
+                            except Exception:
+                                pass
             
             # Get dialog filters (folders) - try multiple methods
             filters_list = None
@@ -546,6 +688,35 @@ class TelegramAPI:
                 return []
             
             folders = []
+
+            # Build a dialog index once; this is more reliable than resolving every peer via API.
+            all_dialogs = await client.get_dialogs()
+            dialog_index = {}
+            for dialog in all_dialogs:
+                entity = dialog.entity
+                if hasattr(entity, 'channel_id'):
+                    dialog_index[('channel', entity.channel_id)] = entity
+                elif hasattr(entity, 'chat_id'):
+                    dialog_index[('chat', entity.chat_id)] = entity
+                elif hasattr(entity, 'id'):
+                    # Most Telethon entities expose .id as channel/chat/user id
+                    if dialog.is_channel:
+                        dialog_index[('channel', entity.id)] = entity
+                    elif dialog.is_group:
+                        dialog_index[('chat', entity.id)] = entity
+                    else:
+                        dialog_index[('user', entity.id)] = entity
+
+            def _extract_peer_key(raw_peer):
+                """Return normalized peer key: ('channel'|'chat'|'user', id)"""
+                peer = raw_peer.peer if hasattr(raw_peer, 'peer') else raw_peer
+                if hasattr(peer, 'channel_id'):
+                    return ('channel', int(peer.channel_id))
+                if hasattr(peer, 'chat_id'):
+                    return ('chat', int(peer.chat_id))
+                if hasattr(peer, 'user_id'):
+                    return ('user', int(peer.user_id))
+                return None
             
             if filters_list:
                 for folder in filters_list:
@@ -632,127 +803,39 @@ class TelegramAPI:
                             except Exception as dialog_error:
                                 logger.error(f"Error fetching dialogs for folder {folder.id}: {dialog_error}")
                         
-                        # Process peers in batches to avoid timeout
-                        batch_size = 10
                         total_peers = len(include_peers)
                         processed = 0
-                        
+                        added_ids = set()
+
                         for i, peer in enumerate(include_peers):
                             try:
-                                # Get chat info - handle different peer types
                                 chat = None
-                                
-                                # Debug: Log peer type
-                                peer_attrs = [a for a in dir(peer) if not a.startswith('_') and not callable(getattr(peer, a, None))]
-                                logger.info(f"Peer {i} type: {type(peer).__name__}, attrs: {peer_attrs[:15]}")
-                                
-                                # Try different methods to get the entity
-                                m1_error = m2_error = m3_error = m4_error = None
-                                chat = None
-                                
-                                try:
-                                    # Method 1: Direct get_entity
-                                    chat = await client.get_entity(peer)
-                                    logger.info(f"Method 1 success for peer {i}: {chat.title if hasattr(chat, 'title') else chat.id}")
-                                except Exception as e:
-                                    m1_error = str(e)
-                                    
-                                    # Method 2: Extract from InputDialogPeer (most common for folders)
-                                    try:
-                                        if hasattr(peer, 'peer'):
-                                            inner_peer = peer.peer
-                                            logger.info(f"Peer {i} has inner peer: {type(inner_peer).__name__}")
-                                            
-                                            # Handle InputPeerChannel, InputPeerChat inside InputDialogPeer
-                                            if hasattr(inner_peer, 'channel_id'):
-                                                from telethon.tl.types import PeerChannel
-                                                chat = await client.get_entity(PeerChannel(inner_peer.channel_id))
-                                                logger.info(f"Method 2a (PeerChannel) success for peer {i}: {chat.title}")
-                                            elif hasattr(inner_peer, 'chat_id'):
-                                                from telethon.tl.types import PeerChat
-                                                chat = await client.get_entity(PeerChat(inner_peer.chat_id))
-                                                logger.info(f"Method 2b (PeerChat) success for peer {i}: {chat.title}")
-                                            elif hasattr(inner_peer, 'user_id'):
-                                                from telethon.tl.types import PeerUser
-                                                chat = await client.get_entity(PeerUser(inner_peer.user_id))
-                                                logger.info(f"Method 2c (PeerUser) success for peer {i}")
-                                            else:
-                                                chat = await client.get_entity(inner_peer)
-                                                logger.info(f"Method 2d (direct) success for peer {i}")
-                                    except Exception as e:
-                                        m2_error = str(e)
-                                    
-                                    # Method 3: Extract ID from peer attributes
-                                    if not chat:
-                                        try:
-                                            peer_id = None
-                                            peer_type = None
-                                            
-                                            # Check for InputPeerChannel, InputPeerChat, etc.
-                                            if hasattr(peer, 'channel_id'):
-                                                peer_id = peer.channel_id
-                                                peer_type = 'channel'
-                                            elif hasattr(peer, 'chat_id'):
-                                                peer_id = peer.chat_id
-                                                peer_type = 'chat'
-                                            elif hasattr(peer, 'user_id'):
-                                                peer_id = peer.user_id
-                                                peer_type = 'user'
-                                            
-                                            if peer_id:
-                                                logger.info(f"Peer {i} is {peer_type} with ID: {peer_id}")
-                                                # Construct proper peer object
-                                                from telethon.tl.types import PeerChannel, PeerChat, PeerUser
-                                                if peer_type == 'channel':
-                                                    chat = await client.get_entity(PeerChannel(peer_id))
-                                                elif peer_type == 'chat':
-                                                    chat = await client.get_entity(PeerChat(peer_id))
-                                                elif peer_type == 'user':
-                                                    chat = await client.get_entity(PeerUser(peer_id))
-                                                logger.info(f"Method 3 success for peer {i}: {chat.title if hasattr(chat, 'title') else chat.id}")
-                                        except Exception as e:
-                                            m3_error = str(e)
-                                
-                                # Method 4: Use access_hash directly (bypass SQLite)
-                                if not chat and hasattr(peer, 'channel_id') and hasattr(peer, 'access_hash'):
-                                    try:
-                                        from telethon.tl.types import InputPeerChannel
-                                        channel_id = peer.channel_id
-                                        access_hash = peer.access_hash
-                                        logger.info(f"Method 4: Using access_hash for channel {channel_id}")
-                                        
-                                        # Create InputPeerChannel directly
-                                        input_peer = InputPeerChannel(channel_id, access_hash)
-                                        
-                                        # Try to get entity using the input peer directly
-                                        chat = await client.get_entity(input_peer)
-                                        logger.info(f"Method 4 success for peer {i}: {chat.title if hasattr(chat, 'title') else chat.id}")
-                                    except Exception as e:
-                                        m4_error = str(e)
-                                
-                                if not chat:
-                                    logger.warning(f"All methods failed for peer {i}: M1={m1_error}, M2={m2_error}, M3={m3_error}, M4={m4_error}")
-                                
-                                if chat:
-                                    chat_title = getattr(chat, 'title', str(chat.id))
-                                    folder_data['groups'].append({
-                                        'id': str(chat.id),
-                                        'title': chat_title
-                                    })
-                                    processed += 1
-                                    logger.debug(f"Added chat to folder: {chat_title}")
+                                key = _extract_peer_key(peer)
+                                if key and key in dialog_index:
+                                    chat = dialog_index[key]
                                 else:
-                                    logger.warning(f"Could not get chat for peer {i}")
-                                
-                                # Log progress every batch
-                                if (i + 1) % batch_size == 0:
-                                    logger.info(f"Processed {i + 1}/{total_peers} peers for folder {folder.id} (success: {processed})")
-                                    
+                                    # Fallback for peers not present in dialogs index
+                                    try:
+                                        resolved_peer = peer.peer if hasattr(peer, 'peer') else peer
+                                        chat = await client.get_entity(resolved_peer)
+                                    except Exception:
+                                        chat = None
+
+                                if chat:
+                                    chat_id = str(getattr(chat, 'id', ''))
+                                    if chat_id and chat_id not in added_ids:
+                                        added_ids.add(chat_id)
+                                        chat_title = getattr(chat, 'title', f"Chat {chat_id}")
+                                        folder_data['groups'].append({
+                                            'id': chat_id,
+                                            'title': chat_title
+                                        })
+                                        processed += 1
                             except Exception as e:
-                                logger.debug(f"Could not get entity for peer {i}: {e}")
+                                logger.debug(f"Could not resolve peer {i} in folder {folder.id}: {e}")
                                 continue
-                        
-                        logger.info(f"Successfully processed {processed}/{total_peers} peers for folder {folder.id}")
+
+                        logger.info(f"Processed {processed}/{total_peers} peers for folder {folder.id}")
                         
                         folders.append(folder_data)
                         # Safe logging for Unicode characters - ASCII only
@@ -771,7 +854,7 @@ class TelegramAPI:
             logger.error(traceback.format_exc())
             return []
         finally:
-            if client:
+            if client and not using_cached_client:
                 try:
                     await client.disconnect()
                 except Exception as disconnect_error:
@@ -782,74 +865,79 @@ class TelegramAPI:
         if not self.is_valid_api:
             return False, "API credentials are invalid. Please update your TELEGRAM_API_ID and TELEGRAM_API_HASH in .env file."
         
-        # Get session lock for this phone number to prevent concurrent access
-        session_lock = get_session_lock(phone_number)
-        
-        # Wait for lock with timeout to prevent indefinite blocking
-        try:
-            await asyncio.wait_for(session_lock.acquire(), timeout=30.0)
-            logger.info(f"Session lock acquired for {phone_number}")
-        except asyncio.TimeoutError:
-            logger.error(f"Could not acquire session lock for {phone_number} within 30 seconds")
-            return False, "Session busy - another message is being sent from this account"
-        
         client = None
         try:
+            async with session_access(phone_number):
             # Create session file name for this phone number
-            import os
-            sessions_dir = 'sessions'
-            if not os.path.exists(sessions_dir):
-                os.makedirs(sessions_dir)
-            
-            session_file = f"{sessions_dir}/{phone_number.replace('+', '')}_session"
-            
-            # Create new client with session file
-            client = TelegramClient(session_file, self.api_id, self.api_hash)
-            
-            # Connect and start
-            await client.connect()
-            if not await client.is_user_authorized():
-                logger.warning(f"User not authorized for {phone_number}, session may be invalid")
-                return False, "User not authorized. Please re-authenticate your account."
-            
-            success_count = 0
-            failed_groups = []
-            
-            # Send messages in batches: 20 messages, then 1-2 second pause
-            batch_size = 20
-            
-            for i, group_id in enumerate(group_ids):
+                import os
+                sessions_dir = 'sessions'
+                if not os.path.exists(sessions_dir):
+                    os.makedirs(sessions_dir)
+                
+                session_file = f"{sessions_dir}/{phone_number.replace('+', '')}_session"
+                
+                # Create new client with session file and SQLite optimizations
+                client = TelegramClient(
+                    session_file, 
+                    self.api_id, 
+                    self.api_hash,
+                    request_retries=3,
+                    connection_retries=3,
+                    flood_sleep_threshold=60,
+                    entity_cache_limit=ENTITY_CACHE_LIMIT
+                )
+                
+                # Set SQLite WAL mode and timeout
                 try:
-                    # Convert group_id to int
-                    group_id_int = int(group_id)
-                    
-                    # Send message to group
-                    await client.send_message(group_id_int, message_text)
-                    success_count += 1
-                    logger.info(f"Message sent to group {group_id} ({i+1}/{len(group_ids)})")
-                    
-                    # Check if we need a pause after this message
-                    if i < len(group_ids) - 1:  # Not the last message
-                        # After every 20 messages, pause 1-2 seconds
-                        if (i + 1) % batch_size == 0:
-                            logger.info(f"Batch complete ({batch_size} messages). Pausing 1.5s...")
-                            await asyncio.sleep(1.5)  # 1.5 seconds pause between batches
-                        else:
-                            # Small delay between messages in same batch (0.3s)
-                            await asyncio.sleep(0.3)
+                    client.session._db.execute("PRAGMA journal_mode=WAL")
+                    client.session._db.execute("PRAGMA busy_timeout=5000")
+                except:
+                    pass
+                
+                # Connect and start
+                await client.connect()
+                if not await client.is_user_authorized():
+                    logger.warning(f"User not authorized for {phone_number}, session may be invalid")
+                    return False, "User not authorized. Please re-authenticate your account."
+                
+                success_count = 0
+                failed_groups = []
+                
+                # Send messages in batches: 20 messages, then 1-2 second pause
+                batch_size = 20
+                
+                for i, group_id in enumerate(group_ids):
+                    try:
+                        # Convert group_id to int
+                        group_id_int = int(group_id)
                         
-                except Exception as e:
-                    failed_groups.append(group_id)
-                    logger.error(f"Failed to send message to group {group_id}: {e}")
-                    # Add extra delay after error to avoid further rate limiting
-                    await asyncio.sleep(2)
-            
-            if success_count > 0:
-                result = (True, f"{success_count} guruhga muvaffaqiyatli yuborildi")
-            else:
-                result = (False, "Hech qanday guruhga xabar yuborilmadi")
-            
-            return result
+                        # Send message to group
+                        await client.send_message(group_id_int, message_text)
+                        success_count += 1
+                        logger.info(f"Message sent to group {group_id} ({i+1}/{len(group_ids)})")
+                        
+                        # Check if we need a pause after this message
+                        if i < len(group_ids) - 1:  # Not the last message
+                            # After every 20 messages, pause 1-2 seconds
+                            if (i + 1) % batch_size == 0:
+                                logger.info(f"Batch complete ({batch_size} messages). Pausing 1.5s...")
+                                await asyncio.sleep(1.5)  # 1.5 seconds pause between batches
+                            else:
+                                # Small delay between messages in same batch (0.3s)
+                                await asyncio.sleep(0.3)
+                            
+                    except Exception as e:
+                        failed_groups.append(group_id)
+                        logger.error(f"Failed to send message to group {group_id}: {e}")
+                        # Add extra delay after error to avoid further rate limiting
+                        await asyncio.sleep(2)
+                
+                if success_count > 0:
+                    result = (True, f"{success_count} guruhga muvaffaqiyatli yuborildi")
+                else:
+                    result = (False, "Hech qanday guruhga xabar yuborilmadi")
+                
+                return result
             
         except ApiIdInvalidError:
             logger.error("API ID/Hash is invalid")
@@ -859,11 +947,7 @@ class TelegramAPI:
             logger.error(f"Failed to send messages to groups: {e}")
             return False, f"Message sending failed: {str(e)}"
         finally:
-            # Always release the lock first
-            if session_lock and session_lock.locked():
-                session_lock.release()
-                logger.info(f"Session lock released for {phone_number}")
-            # Then disconnect client
+            # Disconnect client
             if client:
                 try:
                     await client.disconnect()

@@ -432,6 +432,14 @@ async def back_to_main_callback(update: Update, context: ContextTypes.DEFAULT_TY
     db_session = get_session()
     
     try:
+        # If user was in "schedule message" flow, clear its state
+        # so later messages don't get misrouted.
+        if context.user_data:
+            context.user_data.pop('awaiting_message_text', None)
+            context.user_data.pop('message_text', None)
+            context.user_data.pop('message_text_parts', None)
+            context.user_data.pop('pending_message_id', None)
+
         db_user = db_session.query(User).filter(User.telegram_id == str(user.id)).first()
         if db_user:
             # Save current session before switching

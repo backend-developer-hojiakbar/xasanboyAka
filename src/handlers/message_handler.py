@@ -11,32 +11,105 @@ async def schedule_message_callback(update: Update, context: ContextTypes.DEFAUL
     """Handle schedule message callback"""
     message = (
         "📝 <b>Xabarni Rejalashtirish</b>\n\n"
-        "Iltimos, yubormoqchi bo'lgan xabar matnini kiriting:"
+        "Iltimos, yubormoqchi bo'lgan xabar matnini kiriting.\n\n"
+        "Agar matn juda katta bo'lsa, bo'lib yuboring. Oxirida:"
     )
     
-    keyboard = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="back_to_main")]]
+    keyboard = [
+        [InlineKeyboardButton("✅ Tugatish", callback_data="finish_scheduled_message_text")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_to_main")]
+    ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.callback_query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
+    # Accumulate multiple message parts when user sends long texts.
     context.user_data['awaiting_message_text'] = True
+    context.user_data['message_text_parts'] = []
 
 async def handle_scheduled_message_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle scheduled message text input - now with interval selection"""
     if not context.user_data.get('awaiting_message_text'):
         return
     
-    message_text = update.message.text
-    context.user_data['message_text'] = message_text
+    new_part = update.message.text or ""
+    # Store parts to support long messages (can be pasted in multiple Telegram messages).
+    parts = context.user_data.get('message_text_parts')
+    if parts is None:
+        parts = []
+    parts.append(new_part)
+    context.user_data['message_text_parts'] = parts
+
+    full_text = "\n\n".join(parts).strip()
+    context.user_data['message_text'] = full_text
+
+    # If the text is small enough AND it's the first part, keep old UX:
+    # directly show interval selection.
+    # If it's large or multi-part, ask user to press "Tugatish" first.
+    # Telegram text limit is ~4096 chars. We keep a slightly smaller threshold to be safe.
+    AUTO_THRESHOLD = 4000
+    if len(parts) == 1 and len(full_text) <= AUTO_THRESHOLD:
+        context.user_data['awaiting_message_text'] = False
+
+        # Show interval selection options - ALL messages are now repeating by default
+        message = (
+            "📝 <b>Xabar Saqlandi!</b>\n\n"
+            f"<b>Xabar:</b> {full_text[:1000]}{'...' if len(full_text) > 1000 else ''}\n\n"
+            "<b>Qaysi intervalda doimiy yuborilsin?</b>\n\n"
+            "⚠️ <i>Xabar foydalanuvchi to'xtatmagunicha davom etadi!</i>"
+        )
+        
+        keyboard = [
+            [InlineKeyboardButton("🕐 Har 5 daqiqada", callback_data="interval_5min")],
+            [InlineKeyboardButton("🕐 Har 15 daqiqada", callback_data="interval_15min")],
+            [InlineKeyboardButton("🕐 Har 30 daqiqada", callback_data="interval_30min")],
+            [InlineKeyboardButton("🕐 Har 1 soatda", callback_data="interval_1hour")],
+            [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_to_main")]
+        ]
+        reply_markup = InlineKeyboardMarkup(keyboard)
+        
+        await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+        return
+
+    # Multi-part mode: keep awaiting input until user presses "Tugatish"
+    context.user_data['awaiting_message_text'] = True
+    preview = full_text[:300]
+    more = "..." if len(full_text) > 300 else ""
+
+    keyboard = [
+        [InlineKeyboardButton("✅ Tugatish", callback_data="finish_scheduled_message_text")],
+        [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_to_main")]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await update.message.reply_text(
+        f"✅ Qabul qilindi! Kiritishni davom ettirishingiz mumkin.\n"
+        f"Jami uzunlik: {len(full_text)} belgidan iborat.\n\n"
+        f"Preview:\n{preview}{more}",
+        reply_markup=reply_markup
+    )
+
+async def finish_scheduled_message_text_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """User pressed 'Tugatish' after sending big/multi-part message."""
+    parts = context.user_data.get('message_text_parts', [])
+    if not parts:
+        await update.callback_query.answer("Xabar kiritilmadi", show_alert=True)
+        return
+
+    full_text = "\n\n".join(parts).strip()
+    if not full_text:
+        await update.callback_query.answer("Xabar bo'sh", show_alert=True)
+        return
+
+    context.user_data['message_text'] = full_text
     context.user_data['awaiting_message_text'] = False
-    
-    # Show interval selection options - ALL messages are now repeating by default
+    context.user_data['message_text_parts'] = []
+
     message = (
-        f"📝 <b>Xabar Saqlandi!</b>\n\n"
-        f"<b>Xabar:</b> {message_text[:1000]}{'...' if len(message_text) > 1000 else ''}\n\n"
+        "📝 <b>Xabar Saqlandi!</b>\n\n"
+        f"<b>Xabar:</b> {full_text[:1000]}{'...' if len(full_text) > 1000 else ''}\n\n"
         "<b>Qaysi intervalda doimiy yuborilsin?</b>\n\n"
         "⚠️ <i>Xabar foydalanuvchi to'xtatmagunicha davom etadi!</i>"
     )
-    
+
     keyboard = [
         [InlineKeyboardButton("🕐 Har 5 daqiqada", callback_data="interval_5min")],
         [InlineKeyboardButton("🕐 Har 15 daqiqada", callback_data="interval_15min")],
@@ -45,8 +118,8 @@ async def handle_scheduled_message_text(update: Update, context: ContextTypes.DE
         [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_to_main")]
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
-    
-    await update.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
+
+    await update.callback_query.message.reply_text(message, reply_markup=reply_markup, parse_mode='HTML')
 
 async def handle_interval_selection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle interval selection for repeating messages"""
@@ -433,6 +506,7 @@ async def show_telegram_folders(update: Update, context: ContextTypes.DEFAULT_TY
             if 'selected_folders' not in context.user_data:
                 context.user_data['selected_folders'] = []
             
+            import re
             keyboard = []
             for folder in folders:
                 # Ensure title is a string
@@ -440,6 +514,9 @@ async def show_telegram_folders(update: Update, context: ContextTypes.DEFAULT_TY
                 if not isinstance(folder_title, str):
                     folder_title = str(folder_title)
                 folder_name = folder_title[:25]
+                # Some sources may append counts like "Shaxsiy (10)" to the title.
+                # We strip a trailing "(number)" so UI shows only the real folder name.
+                folder_name = re.sub(r"\s*\(\d+\)\s*$", "", folder_name)
                 group_count = len(folder.get('groups', []))
                 folder_id = str(folder['id'])
                 
@@ -447,7 +524,8 @@ async def show_telegram_folders(update: Update, context: ContextTypes.DEFAULT_TY
                 is_selected = folder_id in context.user_data['selected_folders']
                 checkmark = "✅" if is_selected else "⬜"
                 
-                button_text = f"{checkmark} {folder_name} ({group_count})"
+                # Do not show group_count in the folder button title.
+                button_text = f"{checkmark} {folder_name}"
                 callback_data = f"toggle_folder_{folder_id}"
                 keyboard.append([InlineKeyboardButton(button_text, callback_data=callback_data)])
             
@@ -1674,25 +1752,8 @@ async def confirm_delete_message_callback(update: Update, context: ContextTypes.
         if scheduled_msg:
             msg_text = scheduled_msg.message_text[:50]
             
-            # Get user phone number for session cleanup
-            db_user = db_session.query(User).filter(User.id == scheduled_msg.user_id).first()
-            phone_number = db_user.phone_number if db_user else None
-            
             db_session.delete(scheduled_msg)
             db_session.commit()
-            
-            # Cleanup session file if no more active messages for this user
-            if phone_number:
-                active_messages = db_session.query(ScheduledMessage).filter(
-                    ScheduledMessage.user_id == db_user.id,
-                    ScheduledMessage.is_active == True
-                ).count()
-                
-                if active_messages == 0:
-                    # No more active messages, cleanup session
-                    from src.utils.scheduler import cleanup_session_file
-                    cleanup_session_file(phone_number)
-                    logger.info(f"Session file cleaned up for user {user.id} - no active messages")
             
             message = (
                 f"✅ <b>Xabar O'chirildi!</b>\n\n"

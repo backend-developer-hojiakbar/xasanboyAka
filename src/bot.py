@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import sys
 from telegram.ext import Application, CommandHandler, CallbackQueryHandler, MessageHandler, filters
 from telegram import Update
 from src.handlers.auth_handler import (
@@ -21,6 +22,7 @@ from src.handlers.message_handler import (
     use_scheduled_message_callback, new_message_callback, message_schedule_callback,
     use_folder_callback, new_group_selection_callback, save_as_folder_callback, handle_folder_name_input,
     clear_all_messages_callback, manage_message_callback, confirm_clear_all_callback,
+    finish_scheduled_message_text_callback,
     handle_interval_selection, set_interval_target_groups, handle_interval_group_selection,
     finish_interval_group_selection, confirm_delete_message_callback,
     show_telegram_folders, handle_folder_selection,
@@ -71,6 +73,12 @@ def setup_handlers(application: Application):
     # Message handlers
     application.add_handler(CallbackQueryHandler(message_schedule_callback, pattern="^message_schedule$"))
     application.add_handler(CallbackQueryHandler(schedule_message_callback, pattern="^schedule_message$"))
+    application.add_handler(
+        CallbackQueryHandler(
+            finish_scheduled_message_text_callback,
+            pattern="^finish_scheduled_message_text$"
+        )
+    )
     application.add_handler(CallbackQueryHandler(send_message_callback, pattern="^send_message$"))
     application.add_handler(CallbackQueryHandler(scheduled_messages_callback, pattern="^scheduled_messages$"))
     
@@ -213,6 +221,10 @@ def main():
         setup_handlers(application)
         
         logger.info("Bot ishga tushirish yakunlandi")
+        
+        # Fix for Python 3.14: Set event loop policy
+        if sys.version_info >= (3, 14):
+            asyncio.set_event_loop(asyncio.new_event_loop())
         
         # Start the bot
         application.run_polling(allowed_updates=Update.ALL_TYPES)

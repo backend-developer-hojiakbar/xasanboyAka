@@ -253,7 +253,7 @@ async def check_and_send_messages():
             db_session.rollback()
             pending_messages = []
         
-        # 3. Auto-delete messages older than 6 hours and cleanup session files
+        # 3. Auto-delete messages older than 6 hours
         six_hours_go = now - timedelta(hours=6)
         old_messages = db_session.query(ScheduledMessage).filter(
             ScheduledMessage.is_active == True,
@@ -263,17 +263,9 @@ async def check_and_send_messages():
         
         deleted_count = 0
         for old_msg in old_messages:
-            # Get user phone number before deleting
-            old_user = db_session.query(User).filter(User.id == old_msg.user_id).first()
-            old_phone = old_user.phone_number if old_user else None
-            
             db_session.delete(old_msg)  # PERMANENTLY DELETE after 6 hours
             deleted_count += 1
             logger.info(f"Auto-deleted message {old_msg.id} (created at {old_msg.created_at}, older than 6 hours)")
-            
-            # Cleanup session file
-            if old_phone:
-                cleanup_session_file(old_phone)
         
         if deleted_count > 0:
             db_session.commit()
