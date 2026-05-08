@@ -1,11 +1,210 @@
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import ContextTypes
 from datetime import datetime, timedelta
-from src.models.database import get_session, User, ScheduledMessage, UserGroup
+import asyncio
+import json
+from src.models.database import get_session, User, ScheduledMessage, UserGroup, GroupFolder
 from src.utils.helpers import setup_logging
 from src.utils.telegram_api import verifier
 
 logger = setup_logging()
+
+SCHEDULE_FOLDER_CONFIG_NAME = "__schedule_folder_targets__"
+FOLDER_CACHE_NAME = "__telegram_folder_cache__"
+_folder_sync_tasks = {}
+
+
+def _load_schedule_folder_config(db_session, user_id):
+    config = db_session.query(GroupFolder).filter(
+        GroupFolder.user_id == user_id,
+        GroupFolder.folder_name == SCHEDULE_FOLDER_CONFIG_NAME
+    ).first()
+    if not config or not config.group_ids:
+        return {}
+    try:
+        return json.loads(config.group_ids)
+    except Exception:
+        return {}
+
+
+def _save_schedule_folder_config(db_session, user_id, payload):
+    config = db_session.query(GroupFolder).filter(
+        GroupFolder.user_id == user_id,
+        GroupFolder.folder_name == SCHEDULE_FOLDER_CONFIG_NAME
+    ).first()
+    serialized = json.dumps(payload)
+    if config:
+        config.group_ids = serialized
+    else:
+        config = GroupFolder(
+            user_id=user_id,
+            folder_name=SCHEDULE_FOLDER_CONFIG_NAME,
+            group_ids=serialized
+        )
+        db_session.add(config)
+    db_session.commit()
+
+
+async def _resolve_target_groups_from_saved_folders(db_user, db_session):
+    """Resolve target groups from local DB cache without Telegram API calls."""
+    config = _load_schedule_folder_config(db_session, db_user.id)
+    selected_folder_ids = [str(fid) for fid in config.get("selected_folder_ids", [])]
+    if not selected_folder_ids:
+        return [], []
+
+    cache_row = db_session.query(GroupFolder).filter(
+        GroupFolder.user_id == db_user.id,
+        GroupFolder.folder_name == FOLDER_CACHE_NAME
+    ).first()
+
+    folder_cache = {}
+    if cache_row and cache_row.group_ids:
+        try:
+            cache_payload = json.loads(cache_row.group_ids)
+            for folder in cache_payload.get("folders", []):
+                folder_cache[str(folder.get("id"))] = folder
+        except Exception:
+            folder_cache = {}
+
+    all_group_ids = []
+    folder_names = config.get("selected_folder_titles", [])
+    for folder_id in selected_folder_ids:
+        folder = folder_cache.get(folder_id)
+        if not folder:
+            continue
+        for gid in folder.get("group_ids", []):
+            gid = str(gid)
+            if gid:
+                all_group_ids.append(gid)
+
+    # Legacy/fallback cache kept in config payload
+    if not all_group_ids:
+        cached_group_ids = config.get("cached_group_ids", [])
+        all_group_ids = [str(g) for g in cached_group_ids if str(g)]
+        folder_names = config.get("selected_folder_titles", [])
+
+    unique_group_ids = list(dict.fromkeys(all_group_ids))
+    return unique_group_ids, folder_names
+
+
+def _fallback_active_user_groups(db_session, db_user):
+    """Hard fallback so scheduling never blocks: use active groups from DB."""
+    groups = db_session.query(UserGroup).filter(
+        UserGroup.user_id == db_user.id,
+        UserGroup.is_active == True
+    ).all()
+    return [str(g.group_id) for g in groups if g.group_id]
+
+
+def _load_folder_name_cache(db_session, user_id):
+    cache_row = db_session.query(GroupFolder).filter(
+        GroupFolder.user_id == user_id,
+        GroupFolder.folder_name == FOLDER_CACHE_NAME
+    ).first()
+    if not cache_row or not cache_row.group_ids:
+        return []
+    try:
+        payload = json.loads(cache_row.group_ids)
+        folders = payload.get("folders", [])
+        return [{"id": str(f.get("id")), "title": str(f.get("title", f"Folder {f.get('id')}"))} for f in folders]
+    except Exception:
+        return []
+
+
+def _save_folder_cache(db_session, user_id, folders):
+    cache_row = db_session.query(GroupFolder).filter(
+        GroupFolder.user_id == user_id,
+        GroupFolder.folder_name == FOLDER_CACHE_NAME
+    ).first()
+    payload = {
+        "updated_at": datetime.utcnow().isoformat(),
+        "folders": folders
+    }
+    serialized = json.dumps(payload)
+    if cache_row:
+        cache_row.group_ids = serialized
+    else:
+        db_session.add(GroupFolder(
+            user_id=user_id,
+            folder_name=FOLDER_CACHE_NAME,
+            group_ids=serialized
+        ))
+    db_session.commit()
+
+
+async def _refresh_folder_group_cache(user_id, phone_number):
+    """Background sync: fetch full folder->groups mapping and cache it in DB."""
+    if not phone_number:
+        return
+    folders = await verifier.get_user_folders(phone_number)
+    mapped = []
+    for folder in folders:
+        fid = str(folder.get("id"))
+        title = folder.get("title", f"Folder {fid}")
+        if not isinstance(title, str):
+            title = str(title)
+        group_ids = [str(g.get("id")) for g in folder.get("groups", []) if g.get("id")]
+        mapped.append({"id": fid, "title": title, "group_ids": list(dict.fromkeys(group_ids))})
+
+    db_session = get_session()
+    try:
+        _save_folder_cache(db_session, user_id, mapped)
+        logger.info(f"Folder cache synced for user={user_id}, folders={len(mapped)}")
+        return True
+    except Exception as e:
+        logger.error(f"Folder cache sync error for user={user_id}: {e}")
+        return False
+    finally:
+        db_session.close()
+
+
+def _ensure_folder_cache_sync(user_id, phone_number, force=False):
+    """Start at most one background sync task per user."""
+    existing_task = _folder_sync_tasks.get(user_id)
+    if existing_task and not existing_task.done() and not force:
+        return False
+
+    task = asyncio.create_task(_refresh_folder_group_cache(user_id, phone_number))
+
+    def _cleanup(done_task):
+        current = _folder_sync_tasks.get(user_id)
+        if current is done_task:
+            _folder_sync_tasks.pop(user_id, None)
+
+    task.add_done_callback(_cleanup)
+    _folder_sync_tasks[user_id] = task
+    return True
+
+
+async def _hydrate_scheduled_message_targets(message_id, user_id, phone_number):
+    """Populate scheduled message targets in background without blocking user."""
+    try:
+        await _refresh_folder_group_cache(user_id, phone_number)
+    except Exception as e:
+        logger.warning(f"Background cache refresh failed for user={user_id}: {e}")
+
+    db_session = get_session()
+    try:
+        db_user = db_session.query(User).filter(User.id == user_id).first()
+        scheduled_msg = db_session.query(ScheduledMessage).filter(
+            ScheduledMessage.id == message_id,
+            ScheduledMessage.user_id == user_id,
+            ScheduledMessage.is_active == True
+        ).first()
+        if not db_user or not scheduled_msg:
+            return
+
+        target_groups, _ = await _resolve_target_groups_from_saved_folders(db_user, db_session)
+        if not target_groups:
+            target_groups = _fallback_active_user_groups(db_session, db_user)
+        if target_groups:
+            scheduled_msg.target_groups = json.dumps(target_groups)
+            db_session.commit()
+            logger.info(f"Hydrated targets for message={message_id}, groups={len(target_groups)}")
+    except Exception as e:
+        logger.error(f"Hydrate scheduled targets error message={message_id}: {e}")
+    finally:
+        db_session.close()
 
 async def schedule_message_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle schedule message callback"""
@@ -59,7 +258,6 @@ async def handle_scheduled_message_text(update: Update, context: ContextTypes.DE
         )
         
         keyboard = [
-            [InlineKeyboardButton("🕐 Har 5 daqiqada", callback_data="interval_5min")],
             [InlineKeyboardButton("🕐 Har 15 daqiqada", callback_data="interval_15min")],
             [InlineKeyboardButton("🕐 Har 30 daqiqada", callback_data="interval_30min")],
             [InlineKeyboardButton("🕐 Har 1 soatda", callback_data="interval_1hour")],
@@ -111,7 +309,6 @@ async def finish_scheduled_message_text_callback(update: Update, context: Contex
     )
 
     keyboard = [
-        [InlineKeyboardButton("🕐 Har 5 daqiqada", callback_data="interval_5min")],
         [InlineKeyboardButton("🕐 Har 15 daqiqada", callback_data="interval_15min")],
         [InlineKeyboardButton("🕐 Har 30 daqiqada", callback_data="interval_30min")],
         [InlineKeyboardButton("🕐 Har 1 soatda", callback_data="interval_1hour")],
@@ -125,7 +322,6 @@ async def handle_interval_selection(update: Update, context: ContextTypes.DEFAUL
     """Handle interval selection for repeating messages"""
     callback_data = update.callback_query.data
     interval_map = {
-        "interval_5min": (5, "daqiqa"),
         "interval_15min": (15, "daqiqa"),
         "interval_30min": (30, "daqiqa"),
         "interval_1hour": (60, "soat")
@@ -145,6 +341,11 @@ async def handle_interval_selection(update: Update, context: ContextTypes.DEFAUL
     db_session = get_session()
     
     try:
+        try:
+            await update.callback_query.answer("⏳ Faollashtirilmoqda...")
+        except Exception:
+            pass
+
         db_user = db_session.query(User).filter(User.telegram_id == str(user.id)).first()
         if db_user:
             # Create repeating message
@@ -159,31 +360,45 @@ async def handle_interval_selection(update: Update, context: ContextTypes.DEFAUL
             )
             db_session.add(scheduled_msg)
             db_session.commit()
-            
-            # Store message ID for group selection
-            context.user_data['pending_message_id'] = scheduled_msg.id
-            
-            # Clear previous folder selection for new message
-            context.user_data['selected_folders'] = []
-            
+
+            # Non-blocking UX: use whatever is available quickly.
+            target_groups, folder_names = await _resolve_target_groups_from_saved_folders(db_user, db_session)
+            if target_groups:
+                scheduled_msg.target_groups = json.dumps(target_groups)
+                db_session.commit()
+                groups_count = len(target_groups)
+                folder_preview = ", ".join(folder_names[:3]) if folder_names else "Sozlangan folderlar"
+                if len(folder_names) > 3:
+                    folder_preview += "..."
+                source_line = f"<b>Folderlar:</b> {len(folder_names)} ta ({folder_preview})"
+            else:
+                # Immediate activation; hydrate targets in background.
+                groups_count = len(_fallback_active_user_groups(db_session, db_user))
+                source_line = "<b>Holat:</b> Guruhlar fon rejimida tayyorlanmoqda"
+                _ensure_folder_cache_sync(db_user.id, db_user.phone_number, force=False)
+                asyncio.create_task(
+                    _hydrate_scheduled_message_targets(
+                        scheduled_msg.id,
+                        db_user.id,
+                        db_user.phone_number
+                    )
+                )
+
             message = (
-                f"✅ <b>Xabar Rejalashtirildi!</b>\n\n"
+                f"✅ <b>Xabar Faollashtirildi!</b>\n\n"
                 f"<b>Xabar:</b> {message_text[:50]}...\n"
-                f"<b>Interval:</b> Har {interval_minutes} {interval_name}\n\n"
-                "Endi qaysi guruhlarga yuborilishini tanlang:"
+                f"<b>Interval:</b> Har {interval_minutes} {interval_name}\n"
+                f"{source_line}\n"
+                f"<b>Jami guruhlar:</b> {groups_count} ta\n\n"
+                f"⏰ Birinchi xabar {(scheduled_msg.schedule_time + timedelta(hours=5)).strftime('%H:%M')} da yuboriladi.\n"
+                "Keyingi yuborishlar avtomatik davom etadi."
             )
-            
-            # Show folder selection if available, otherwise show regular options
             keyboard = [
-                [InlineKeyboardButton("📁 Telegram Folderlarim", callback_data="select_telegram_folder")],
-                [InlineKeyboardButton("📢 Barcha Guruhlarga", callback_data="set_interval_all_groups")],
-                [InlineKeyboardButton("🎯 Tanlangan Guruhlarga", callback_data="set_interval_selected_groups")],
-                [InlineKeyboardButton("⬅️ Orqaga", callback_data="message_schedule")]
+                [InlineKeyboardButton("📅 Xabarlar Rejasiga O'tish", callback_data="message_schedule")],
+                [InlineKeyboardButton("🏠 Bosh Menyu", callback_data="back_to_main")]
             ]
-            reply_markup = InlineKeyboardMarkup(keyboard)
-            
-            await update.callback_query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
-            logger.info(f"Repeating message created with {interval_minutes}min interval for user {user.id}")
+            await update.callback_query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            logger.info(f"Repeating message {scheduled_msg.id} auto-configured for user {user.id} with {len(target_groups)} groups")
         else:
             await update.callback_query.answer("❌ Foydalanuvchi topilmadi", show_alert=True)
     except Exception as e:
@@ -811,6 +1026,7 @@ async def send_message_callback(update: Update, context: ContextTypes.DEFAULT_TY
     )
     
     keyboard = [
+        [InlineKeyboardButton("📁 Folderni Sozlash", callback_data="configure_send_folders")],
         [InlineKeyboardButton("📢 Barcha Guruhlarga", callback_data="send_all_groups")],
         [InlineKeyboardButton("🎯 Tanlangan Guruhlarga", callback_data="send_selected_groups")],
         [InlineKeyboardButton("⬅️ Orqaga", callback_data="back_to_main")]
@@ -818,6 +1034,187 @@ async def send_message_callback(update: Update, context: ContextTypes.DEFAULT_TY
     reply_markup = InlineKeyboardMarkup(keyboard)
     
     await update.callback_query.message.edit_text(message, reply_markup=reply_markup, parse_mode='HTML')
+
+
+async def configure_send_folders_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Open folder config UI for scheduled messages."""
+    user = update.effective_user
+    db_session = get_session()
+    try:
+        db_user = db_session.query(User).filter(User.telegram_id == str(user.id)).first()
+        if not db_user or not db_user.phone_number:
+            message = (
+                "❌ <b>Telefon raqam topilmadi</b>\n\n"
+                "Avval akkauntingizni ulang, keyin folderlarni sozlang."
+            )
+            keyboard = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="send_message")]]
+            await update.callback_query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            return
+
+        await update.callback_query.message.edit_text("🔄 Folder nomlari yuklanmoqda...")
+        folders = _load_folder_name_cache(db_session, db_user.id)
+        if not folders:
+            folders = await verifier.get_user_folder_names(db_user.phone_number)
+
+        if not folders:
+            message = "❌ Telegram folderlari topilmadi."
+            keyboard = [[InlineKeyboardButton("⬅️ Orqaga", callback_data="send_message")]]
+            await update.callback_query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+            return
+
+        config = _load_schedule_folder_config(db_session, db_user.id)
+        selected = set(config.get("selected_folder_ids", []))
+        context.user_data["config_telegram_folders"] = {str(f["id"]): {"id": str(f["id"]), "title": f.get("title", f"Folder {f['id']}")} for f in folders}
+        context.user_data["config_selected_folder_ids"] = [fid for fid in selected if fid in context.user_data["config_telegram_folders"]]
+        await _render_config_folder_picker(update, context, edit_message=True)
+    except Exception as e:
+        logger.error(f"Folder sozlashni ochishda xato: {e}")
+        await update.callback_query.message.edit_text(
+            "❌ Folder sozlashni ochib bo'lmadi.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="send_message")]]),
+            parse_mode='HTML'
+        )
+    finally:
+        db_session.close()
+
+
+async def _render_config_folder_picker(update: Update, context: ContextTypes.DEFAULT_TYPE, edit_message=False):
+    folders = context.user_data.get("config_telegram_folders", {})
+    selected_ids = set(context.user_data.get("config_selected_folder_ids", []))
+
+    if not folders:
+        text = "❌ Folderlar topilmadi."
+        markup = InlineKeyboardMarkup([[InlineKeyboardButton("⬅️ Orqaga", callback_data="send_message")]])
+    else:
+        text = (
+            "📁 <b>Folderni Sozlash</b>\n\n"
+            "Xabar yuboriladigan folderlarni tanlang:\n"
+            "✅ tanlangan | ⬜ tanlanmagan\n\n"
+            f"<b>Tanlangan:</b> {len(selected_ids)} ta"
+        )
+        keyboard = []
+        for folder_id, folder in list(folders.items())[:40]:
+            title = folder.get("title", f"Folder {folder_id}")
+            if not isinstance(title, str):
+                title = str(title)
+            prefix = "✅" if folder_id in selected_ids else "⬜"
+            keyboard.append([InlineKeyboardButton(f"{prefix} {title[:30]}", callback_data=f"config_folder_toggle_{folder_id}")])
+        keyboard.append([InlineKeyboardButton("💾 Saqlash", callback_data="config_folder_save")])
+        keyboard.append([InlineKeyboardButton("🔄 Tarkibni Yangilash", callback_data="config_folder_sync")])
+        keyboard.append([InlineKeyboardButton("🔄 Tozalash", callback_data="config_folder_clear")])
+        keyboard.append([InlineKeyboardButton("⬅️ Orqaga", callback_data="send_message")])
+        markup = InlineKeyboardMarkup(keyboard)
+
+    if edit_message:
+        await update.callback_query.message.edit_text(text, reply_markup=markup, parse_mode='HTML')
+    else:
+        await update.callback_query.edit_message_text(text, reply_markup=markup, parse_mode='HTML')
+
+
+async def config_folder_toggle_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    folder_id = update.callback_query.data.replace("config_folder_toggle_", "")
+    selected = context.user_data.get("config_selected_folder_ids", [])
+    if folder_id in selected:
+        selected.remove(folder_id)
+    else:
+        selected.append(folder_id)
+    context.user_data["config_selected_folder_ids"] = selected
+    await _render_config_folder_picker(update, context)
+
+
+async def config_folder_clear_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    context.user_data["config_selected_folder_ids"] = []
+    await _render_config_folder_picker(update, context)
+
+
+async def config_folder_save_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    selected_ids = context.user_data.get("config_selected_folder_ids", [])
+    folder_map = context.user_data.get("config_telegram_folders", {})
+    if not selected_ids:
+        await update.callback_query.answer("Kamida bitta folder tanlang", show_alert=True)
+        return
+
+    user = update.effective_user
+    db_session = get_session()
+    try:
+        db_user = db_session.query(User).filter(User.telegram_id == str(user.id)).first()
+        if not db_user:
+            await update.callback_query.answer("Foydalanuvchi topilmadi", show_alert=True)
+            return
+
+        selected_titles = []
+        for folder_id in selected_ids:
+            folder = folder_map.get(folder_id)
+            if not folder:
+                continue
+            title = folder.get("title", f"Folder {folder_id}")
+            if not isinstance(title, str):
+                title = str(title)
+            selected_titles.append(title)
+
+        # Derive group IDs from cache snapshot if available.
+        cache_row = db_session.query(GroupFolder).filter(
+            GroupFolder.user_id == db_user.id,
+            GroupFolder.folder_name == FOLDER_CACHE_NAME
+        ).first()
+        cached_group_ids = []
+        if cache_row and cache_row.group_ids:
+            try:
+                cache_payload = json.loads(cache_row.group_ids)
+                cache_map = {str(f.get("id")): f for f in cache_payload.get("folders", [])}
+                for folder_id in selected_ids:
+                    folder = cache_map.get(str(folder_id), {})
+                    cached_group_ids.extend([str(gid) for gid in folder.get("group_ids", []) if str(gid)])
+            except Exception:
+                cached_group_ids = []
+        unique_group_ids = list(dict.fromkeys(cached_group_ids))
+
+        payload = {
+            "selected_folder_ids": [str(fid) for fid in selected_ids],
+            "selected_folder_titles": selected_titles,
+            "cached_group_ids": unique_group_ids,
+            "saved_at": datetime.utcnow().isoformat()
+        }
+        _save_schedule_folder_config(db_session, db_user.id, payload)
+
+        message = (
+            "✅ <b>Folderlar saqlandi!</b>\n\n"
+            f"<b>Folderlar:</b> {len(selected_titles)} ta\n"
+            f"<b>Cache guruhlar:</b> {len(unique_group_ids)} ta\n\n"
+            "Folder nomlari saqlandi. Kerak bo'lsa `Tarkibni Yangilash` bilan cache yangilang.\n"
+            "`Xabar Rejalashtirish` cache bo'sh bo'lsa ham to'xtab qolmaydi."
+        )
+        keyboard = [
+            [InlineKeyboardButton("📁 Folder Sozlash", callback_data="send_message")],
+            [InlineKeyboardButton("🏠 Bosh Menyu", callback_data="back_to_main")]
+        ]
+        await update.callback_query.message.edit_text(message, reply_markup=InlineKeyboardMarkup(keyboard), parse_mode='HTML')
+    except Exception as e:
+        logger.error(f"Folder sozlamasini saqlashda xato: {e}")
+        await update.callback_query.answer("Saqlashda xatolik", show_alert=True)
+    finally:
+        db_session.close()
+
+
+async def config_folder_sync_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Manual trigger for full folder-group cache refresh."""
+    user = update.effective_user
+    db_session = get_session()
+    try:
+        db_user = db_session.query(User).filter(User.telegram_id == str(user.id)).first()
+        if not db_user or not db_user.phone_number:
+            await update.callback_query.answer("Akkaunt topilmadi", show_alert=True)
+            return
+        started = _ensure_folder_cache_sync(db_user.id, db_user.phone_number, force=False)
+        if started:
+            await update.callback_query.answer("Yangilash boshlandi", show_alert=False)
+        else:
+            await update.callback_query.answer("Yangilash allaqachon ketmoqda", show_alert=False)
+    except Exception as e:
+        logger.error(f"Manual folder sync error: {e}")
+        await update.callback_query.answer("Yangilashda xatolik", show_alert=True)
+    finally:
+        db_session.close()
 
 async def send_all_groups_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle send to all groups callback"""

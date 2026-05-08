@@ -859,6 +859,76 @@ class TelegramAPI:
                     await client.disconnect()
                 except Exception as disconnect_error:
                     logger.debug(f"Client disconnect error in get_user_groups: {disconnect_error}")
+
+    async def get_user_folder_names(self, phone_number):
+        """Fast path: get only Telegram folder IDs and names (no peer resolution)."""
+        if not self.is_valid_api:
+            logger.error("get_user_folder_names: API credentials are invalid")
+            return []
+
+        client = None
+        using_cached_client = False
+        try:
+            async with session_access(phone_number):
+                import os
+                sessions_dir = 'sessions'
+                if not os.path.exists(sessions_dir):
+                    os.makedirs(sessions_dir)
+
+                phone_clean = phone_number.replace('+', '')
+                session_file = f"{sessions_dir}/{phone_clean}_session"
+
+                cached_client = get_authorized_client(phone_number)
+                if cached_client:
+                    client = cached_client
+                    using_cached_client = True
+                    if not client.is_connected():
+                        await client.connect()
+                else:
+                    client = TelegramClient(
+                        session_file,
+                        self.api_id,
+                        self.api_hash,
+                        request_retries=3,
+                        connection_retries=3,
+                        flood_sleep_threshold=60,
+                        entity_cache_limit=ENTITY_CACHE_LIMIT
+                    )
+                    await client.connect()
+
+                is_authorized = await client.is_user_authorized()
+                if not is_authorized:
+                    logger.warning(f"User not authorized for {phone_number}")
+                    return []
+
+                from telethon.tl.functions.messages import GetDialogFiltersRequest
+                result = await client(GetDialogFiltersRequest())
+                filters_list = result.filters if hasattr(result, 'filters') else (result if isinstance(result, list) else [])
+
+                folder_names = []
+                for folder in filters_list:
+                    if not hasattr(folder, 'id'):
+                        continue
+                    # Skip default "All chats" filter if custom folders exist.
+                    if folder.id == 0 and len(filters_list) > 1:
+                        continue
+                    raw_title = getattr(folder, 'title', f"Folder {folder.id}")
+                    title = raw_title.text if hasattr(raw_title, 'text') else str(raw_title)
+                    folder_names.append({
+                        'id': str(folder.id),
+                        'title': title
+                    })
+
+                return folder_names
+        except Exception as e:
+            logger.error(f"Failed to get user folder names: {e}")
+            return []
+        finally:
+            if client and not using_cached_client:
+                try:
+                    await client.disconnect()
+                except Exception as disconnect_error:
+                    logger.debug(f"Client disconnect error in get_user_folder_names: {disconnect_error}")
     
     async def send_message_to_groups(self, phone_number, message_text, group_ids, delay_seconds=1):
         """Send message to specified groups with rate limiting and session locking - NO DEMO FALLBACK"""

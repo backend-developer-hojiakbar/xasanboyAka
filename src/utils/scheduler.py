@@ -15,26 +15,28 @@ logger = setup_logging()
 _message_queue = asyncio.Queue()
 _queue_processor_started = False
 _queue_processor_lock = asyncio.Lock()
+_queue_worker_count = max(2, int(os.getenv("SCHEDULER_WORKERS", "4")))
 
 async def process_message_queue():
-    """Process messages from queue with global rate limiting - SINGLE INSTANCE ONLY"""
+    """Start queue worker pool once and keep it alive."""
     global _queue_processor_started
-    
-    # Ensure only one queue processor runs
+
     async with _queue_processor_lock:
         if _queue_processor_started:
             logger.debug("Queue processor already running, skipping")
             return
         _queue_processor_started = True
-    
-    logger.info("Global message queue processor started")
-    
+
+    logger.info(f"Message queue worker pool started: workers={_queue_worker_count}")
+    for worker_idx in range(_queue_worker_count):
+        asyncio.create_task(_queue_worker(worker_idx + 1))
+
+
+async def _queue_worker(worker_id: int):
+    """Queue worker: each worker handles one scheduled item at a time."""
     while True:
         try:
-            # Get message ID from queue (not full object)
             message_id = await _message_queue.get()
-            
-            # Fetch fresh message from database
             from ..models.database import get_session, ScheduledMessage
             db_session = get_session()
             try:
@@ -44,20 +46,18 @@ async def process_message_queue():
                 ).first()
                 
                 if message:
-                    # Process with rate limiting
                     await send_scheduled_message_isolated(message)
                 else:
                     logger.warning(f"Message {message_id} not found or inactive")
             finally:
                 db_session.close()
-            
-            # Small delay to prevent too many requests
-            await asyncio.sleep(2)  # 2 second delay between any two messages
-            
+
+            # Small pacing per worker to reduce burst requests.
+            await asyncio.sleep(0.35)
             _message_queue.task_done()
         except Exception as e:
-            logger.error(f"Queue processing error: {e}")
-            await asyncio.sleep(5)
+            logger.error(f"Queue worker-{worker_id} error: {e}")
+            await asyncio.sleep(2)
 
 def cleanup_session_file(phone_number):
     """Clean up session file for a phone number"""

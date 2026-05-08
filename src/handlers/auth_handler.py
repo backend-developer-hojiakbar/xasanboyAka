@@ -249,7 +249,7 @@ async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, use
     keyboard = [
         [InlineKeyboardButton("➕ Akkaunt Qo'shish", callback_data="add_account")],
         [InlineKeyboardButton("👤 Mening Akkauntim", callback_data="my_account")],
-        [InlineKeyboardButton("📤 Xabar Yuborish", callback_data="send_message")],
+        [InlineKeyboardButton("📁 Folder Sozlash", callback_data="send_message")],
         [InlineKeyboardButton("📅 Xabarlar Rejasi", callback_data="message_schedule")]
     ]
     

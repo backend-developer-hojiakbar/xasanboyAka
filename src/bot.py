@@ -26,7 +26,9 @@ from src.handlers.message_handler import (
     handle_interval_selection, set_interval_target_groups, handle_interval_group_selection,
     finish_interval_group_selection, confirm_delete_message_callback,
     show_telegram_folders, handle_folder_selection,
-    handle_folder_toggle, clear_folder_selection, send_multi_folders
+    handle_folder_toggle, clear_folder_selection, send_multi_folders,
+    configure_send_folders_callback, config_folder_toggle_callback,
+    config_folder_save_callback, config_folder_clear_callback, config_folder_sync_callback
 )
 from src.handlers.admin_handler import (
     admin_panel_callback, admin_manage_users_callback, admin_review_payments_callback,
@@ -85,6 +87,11 @@ def setup_handlers(application: Application):
     # New send message handlers
     application.add_handler(CallbackQueryHandler(send_all_groups_callback, pattern="^send_all_groups$"))
     application.add_handler(CallbackQueryHandler(send_selected_groups_callback, pattern="^send_selected_groups$"))
+    application.add_handler(CallbackQueryHandler(configure_send_folders_callback, pattern="^configure_send_folders$"))
+    application.add_handler(CallbackQueryHandler(config_folder_toggle_callback, pattern=r"^config_folder_toggle_.*$"))
+    application.add_handler(CallbackQueryHandler(config_folder_save_callback, pattern="^config_folder_save$"))
+    application.add_handler(CallbackQueryHandler(config_folder_clear_callback, pattern="^config_folder_clear$"))
+    application.add_handler(CallbackQueryHandler(config_folder_sync_callback, pattern="^config_folder_sync$"))
     application.add_handler(CallbackQueryHandler(select_group_callback, pattern="^select_group_.*$"))
     application.add_handler(CallbackQueryHandler(finish_group_selection_callback, pattern="^finish_group_selection$"))
     application.add_handler(CallbackQueryHandler(use_scheduled_message_callback, pattern="^use_scheduled_\\d+$"))
@@ -102,7 +109,6 @@ def setup_handlers(application: Application):
     application.add_handler(CallbackQueryHandler(confirm_delete_message_callback, pattern="^confirm_delete_\\d+$"))
     
     # Interval message handlers
-    application.add_handler(CallbackQueryHandler(handle_interval_selection, pattern="^interval_5min$"))
     application.add_handler(CallbackQueryHandler(handle_interval_selection, pattern="^interval_15min$"))
     application.add_handler(CallbackQueryHandler(handle_interval_selection, pattern="^interval_30min$"))
     application.add_handler(CallbackQueryHandler(handle_interval_selection, pattern="^interval_1hour$"))
